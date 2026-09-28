@@ -2233,6 +2233,52 @@ class CutlassHummingConfig:
 
 
 @dataclass(frozen=True)
+class MegaMoeFc12Config:
+    """CuTe-DSL MegaMOE FC1/SwiGLU/FC2 compute backend.
+
+    This is a local compute backend: routing, permutation, and output
+    finalization are provided by the unified fused-MoE runner contract.  It
+    therefore works both directly and through the split EP bridge.
+
+    Supports MXFP4 weights with MXFP8 activations, preserving unweighted BF16
+    route terms before deterministic FP32 top-k finalization.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in (100, 103)
+
+    @staticmethod
+    def prepare_weights(
+        w1_bf16,
+        w2_bf16,
+        *,
+        quant: QuantConfig,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
+        device=None,
+    ):
+        """Build the ``megamoe_fc12`` native view from canonical weights."""
+        from .megamoe_fc12 import prepare_megamoe_fc12_weights
+
+        return prepare_megamoe_fc12_weights(
+            w1_bf16,
+            w2_bf16,
+            quant=quant,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            activation=activation,
+            device=device,
+        )
+
+    def __repr__(self) -> str:
+        return "MegaMoeFc12Config()"
+
+
+@dataclass(frozen=True)
 class CuteDslConfig:
     """CuteDSL FP4 backend for W4A4, W4A8, and W4A16.
 
@@ -2629,6 +2675,7 @@ BackendConfigType = Union[
     CutlassW4A8Config,
     CutlassHummingConfig,
     CuteDslConfig,
+    MegaMoeFc12Config,
     SM12xFp8Config,
     SM12xMxfp8Mxfp4Config,
     SM12xNvfp4Bf16Config,
@@ -2673,6 +2720,7 @@ ALL_BACKEND_CONFIGS = (
     CutlassW4A8Config,
     CutlassHummingConfig,
     CuteDslConfig,
+    MegaMoeFc12Config,
     SM12xFp8Config,
     SM12xMxfp8Mxfp4Config,
     SM12xNvfp4Bf16Config,
