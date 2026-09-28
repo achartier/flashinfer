@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Optional, Sequence
+from typing import TYPE_CHECKING, Sequence
 
 from .....algo_knobs import (
     AlgoKnob,
@@ -177,6 +177,18 @@ class NixlEpHandle(Handle):
     def dispatch(self, params: DispatchInputParams) -> DispatchOutput:
         """Forward to ``Buffer.low_latency_dispatch``."""
         x = params.x[0]  # MVP: single token tensor
+        from .....core.comm.padding import pad_ll_rows
+
+        fp = self._fleet.params
+        padded = (
+            fp.transport_hidden_size is not None and x.shape[-1] == fp.token_hidden_size
+        )
+        if padded:
+            if self._fleet.use_fp8:
+                raise ValueError(
+                    "explicit LL transport padding requires native FP8 transport disabled"
+                )
+            x = pad_ll_rows(x, fp.combine_hidden_size)
         buf = self._fleet.buffer
         use_hook = self._use_hook()
         # async_finish is always False. Observed: with async_finish=True this
@@ -223,6 +235,10 @@ class NixlEpHandle(Handle):
             expert_tensors, expert_scales = recv_x[0], recv_x[1]
         else:
             expert_tensors, expert_scales = recv_x, None
+        if padded:
+            # Do not copy before a staged dispatch's recv hook has completed.
+            # The view preserves the logical width; the bridge makes it contiguous.
+            expert_tensors = expert_tensors[..., : fp.token_hidden_size]
         # num_tokens is the per-expert row count of the recv buffer (same
         # semantics as nccl_ep LL EXPERT_MAJOR: max_tokens_per_rank * ranks).
         # Read it off the returned [num_local, rows, hidden] tensor; the
@@ -252,7 +268,11 @@ class NixlEpHandle(Handle):
                 "reweight on combine."
             )
         topk_weights = tw.weights  # type: ignore[attr-defined]
-        out_t: Optional[Any] = params.out
+        from .....core.comm.padding import finish_ll_combine, prepare_ll_combine
+
+        x, out_t, logical_out = prepare_ll_combine(
+            x, params.out, self._fleet.params, self._topk_ids.shape[0]
+        )
         # async_finish=False + recv hook (see dispatch()): the async event
         # path is unreliable in the NIXL MVP and hangs combine under load.
         result = buf.low_latency_combine(
@@ -274,13 +294,25 @@ class NixlEpHandle(Handle):
             combined_x, event, hook = result, None, None
         if self._staged and use_hook:
             self._event = event
-            self._recv_hook = hook
+            if out_t is logical_out:
+                self._recv_hook = hook
+            else:
+
+                def finish_padded_combine():
+                    if hook is not None:
+                        hook()
+                    elif event is not None:
+                        event.current_stream_wait()
+                    finish_ll_combine(combined_x, logical_out)
+
+                self._recv_hook = finish_padded_combine
         else:
             if hook is not None:
                 hook()
+            finish_ll_combine(combined_x, logical_out)
             self._event = None
             self._recv_hook = None
-        return CombineOutput(x=combined_x)
+        return CombineOutput(x=logical_out)
 
     # @flashinfer_api  # disabled per PR #3453 review
     def complete(self) -> None:

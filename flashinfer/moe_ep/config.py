@@ -137,8 +137,27 @@ class FleetParams:
     dtype_bytes: int = 2  # bf16 default; FP8 path overrides
     algorithm: EpAlgorithm = EpAlgorithm.LOW_LATENCY
     layout: EpLayout = EpLayout.EXPERT_MAJOR
+    # Optional LL wire width. Compute/input/output shapes remain token_hidden_size.
+    # Useful for H=6656 with kernels instantiated at H=7168.
+    transport_hidden_size: Optional[int] = None
+
+    @property
+    def combine_hidden_size(self) -> int:
+        return self.transport_hidden_size or self.token_hidden_size
 
     def __post_init__(self) -> None:
+        if self.transport_hidden_size is not None:
+            if self.transport_hidden_size < self.token_hidden_size:
+                raise ValueError("transport_hidden_size must be >= token_hidden_size")
+            if (
+                self.algorithm is not EpAlgorithm.LOW_LATENCY
+                or self.layout is not EpLayout.EXPERT_MAJOR
+            ):
+                raise ValueError("transport_hidden_size requires LL EXPERT_MAJOR")
+            if self.dtype_bytes != 2:
+                raise ValueError(
+                    "transport_hidden_size requires BF16 transport (dtype_bytes=2)"
+                )
         for name in (
             "num_experts",
             "max_tokens_per_rank",

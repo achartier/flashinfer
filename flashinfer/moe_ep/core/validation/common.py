@@ -248,7 +248,7 @@ def validate_ll_hidden_size(params: FleetParams, backend: str) -> None:
     """
     if backend != "nccl_ep" or params.algorithm is not EpAlgorithm.LOW_LATENCY:
         return
-    hidden = params.token_hidden_size
+    hidden = params.combine_hidden_size
     if hidden in _NCCL_EP_LL_HIDDEN_SIZES:
         return
     supported = ", ".join(str(h) for h in _NCCL_EP_LL_HIDDEN_SIZES)
@@ -482,6 +482,8 @@ def validate_fleet_params(
 ) -> None:
     import torch
 
+    validate_ll_hidden_size(params, backend)
+
     if fault_tolerance is not None and fault_tolerance.enabled:
         if params.algorithm is not EpAlgorithm.LOW_LATENCY:
             raise MoEEpConfigError(
@@ -525,9 +527,9 @@ def validate_fleet_params(
                 f"nixl_ep: max_tokens_per_rank ({params.max_tokens_per_rank}) "
                 f"must be ≤ {_NIXL_EP_MAX_TOKENS_PER_RANK}"
             )
-        if params.token_hidden_size not in _NIXL_EP_SUPPORTED_HIDDEN_SIZES:
+        if params.combine_hidden_size not in _NIXL_EP_SUPPORTED_HIDDEN_SIZES:
             raise MoEEpConfigError(
-                f"nixl_ep: token_hidden_size ({params.token_hidden_size}) not "
+                f"nixl_ep: transport hidden size ({params.combine_hidden_size}) not "
                 f"in supported set {sorted(_NIXL_EP_SUPPORTED_HIDDEN_SIZES)}"
             )
         if quant is not None and QuantType.UE8M0 in quant.quants:

@@ -53,6 +53,43 @@ def _dispatch(handle, x):
     return handle.dispatch(DispatchInputParams(x=[x]))
 
 
+def test_ll_packed_dispatch_and_padded_combine_have_independent_widths(
+    fake_nccl_ep, bypass_build_checks
+):
+    import torch
+
+    from flashinfer.moe_ep.backends.split.comm.nccl_ep.fleet import NcclEpFleet
+    from flashinfer.moe_ep.config import (
+        BootstrapConfig,
+        CombineInputParams,
+        FleetParams,
+    )
+
+    fleet = NcclEpFleet(
+        BootstrapConfig(world_size=2, rank=0),
+        FleetParams(4, 16, 6656, transport_hidden_size=7168),
+    )
+    handle = _make_handle(fleet, num_tokens=3)
+    dispatched = _dispatch(handle, torch.zeros(3, 4096, dtype=torch.bfloat16))
+    assert dispatched.expert_tensors.shape == (2, 32, 4096)
+
+    def combine(inputs, outputs, **kwargs):
+        wire_x = inputs.tokens.buffer
+        assert wire_x.shape == (2, 32, 7168)
+        assert torch.all(wire_x[..., :6656] == 2)
+        assert not torch.count_nonzero(wire_x[..., 6656:])
+        outputs.tokens.buffer.fill_(5)
+
+    handle._handle.combine = combine
+    out = torch.empty(3, 6656, dtype=torch.bfloat16)
+    result = handle.combine(
+        CombineInputParams(
+            x=[torch.full((2, 32, 6656), 2, dtype=torch.bfloat16)], out=out
+        )
+    )
+    assert result.x is out and torch.all(out == 5)
+
+
 # -------------------------------------------------------------------- _wrap
 
 
@@ -308,7 +345,7 @@ def test_ll_combine_reuses_cached_config(fake_nccl_ep, bypass_build_checks):
     from flashinfer.moe_ep.config import CombineInputParams
 
     fleet = _make_fleet(fake_nccl_ep)
-    x = torch.zeros(16, 64, dtype=torch.bfloat16)
+    x = torch.zeros(16, fleet.params.token_hidden_size, dtype=torch.bfloat16)
 
     h1 = _make_handle(fleet)
     h1.combine(CombineInputParams(x=[_dispatch(h1, x).expert_tensors]))

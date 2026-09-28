@@ -73,6 +73,7 @@ def materialize_fused_moe_weights(
     """Convert canonical :class:`MoEWeightPack` into a fused_moe weight pack."""
     from ......fused_moe.api import (
         CuteDslConfig,
+        MegaMoeFc12Config,
         MoEWeightPack as FusedMoEWeightPack,
         QuantFormat,
         TrtllmBf16Config,
@@ -133,6 +134,22 @@ def materialize_fused_moe_weights(
                 device=weights.w13.device,
             )
             pack.prepare_for("cute_dsl", view)
+            return pack
+
+        if quant.pair == (QuantFormat.MXFP4, QuantFormat.MXFP8) and isinstance(
+            backend_cfg, MegaMoeFc12Config
+        ):
+            view = MegaMoeFc12Config.prepare_weights(
+                weights.w13,
+                weights.w2,
+                quant=quant,
+                num_local_experts=num_local,
+                hidden_size=hidden,
+                intermediate_size=intermediate,
+                activation=moe_config.activation,
+                device=weights.w13.device,
+            )
+            pack.prepare_for("megamoe_fc12", view)
             return pack
 
     raise ValueError(

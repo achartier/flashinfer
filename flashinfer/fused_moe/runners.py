@@ -7657,6 +7657,293 @@ class B12xW4A16Runner(_B12xRunner):
     )
 
 
+class MegaMoeFc12Runner(MoERunner):
+    """Standalone FC1/SwiGLU/FC2 MegaMOE runner.
+
+    The runner deliberately enters through the regular token-major contract:
+    ``moe_sort`` builds compact expert maps, ``moe_permute`` performs the
+    physical gather, FC12 processes only live expert rows, and
+    deterministic FP32 top-k finalization restores token-major results.
+    """
+
+    backend_key = "megamoe_fc12"
+    supported_routing_modes = (
+        RoutingInputMode.PackedPrecomputed,
+        RoutingInputMode.UnpackedPrecomputed,
+    )
+    supported_quant_variants = ((QuantFormat.MXFP4, QuantFormat.MXFP8),)
+    supported_activation_classes = (SwiGLU,)
+
+    def __init__(self, config: MoEConfig, device: torch.device):
+        super().__init__()
+        from ..utils import device_support_pdl
+
+        self.config = config
+        self.device = torch.device(device)
+        enable_pdl = config.execution.enable_pdl
+        if enable_pdl is None:
+            enable_pdl = device_support_pdl(self.device)
+        self._enable_pdl = enable_pdl
+        self._sort_buffers: Optional[dict[str, torch.Tensor]] = None
+        self._permuted_input: Optional[torch.Tensor] = None
+        self._permuted_scales: Optional[torch.Tensor] = None
+        self._permuted_output: Optional[torch.Tensor] = None
+        self._launcher: Any = None
+        self.tuning_config = TuningConfig()
+
+    def _check_support(self) -> None:
+        super()._check_support()
+        from ..utils import get_compute_capability
+
+        if get_compute_capability(self.device) not in ((10, 0), (10, 3)):
+            raise NotImplementedError(
+                "MXFP8 x MXFP4 MegaMOE FC12 requires SM100 or SM103."
+            )
+        if not self.config.finalize.do_finalize:
+            raise NotImplementedError("MegaMOE FC12 requires do_finalize=True.")
+
+    def _check_activation_parameters(self) -> None:
+        if self.config.activation != SwiGLU():
+            raise NotImplementedError(
+                "MXFP8 x MXFP4 FC12 requires default SwiGLU scalars."
+            )
+
+    def _build(self) -> None:
+        from .cute_dsl.moe_utils import (
+            allocate_moe_sort_buffers,
+        )
+
+        experts = self.config.experts
+        routing = self.config.routing
+        num_local_experts = experts.local_num_experts or routing.num_experts
+        max_tokens = self.config.execution.tune_max_num_tokens
+        # FC12's native data-plane row padding is 64, which also makes the
+        # generic permutation output directly consumable without repacking.
+        tile_size = 64
+        self._sort_buffers = allocate_moe_sort_buffers(
+            max_tokens,
+            routing.num_experts,
+            routing.top_k,
+            num_local_experts,
+            tile_size,
+            device=str(self.device),
+        )
+        # Hidden size is determined by the activation/weight view, so the
+        # FC12 launcher is allocated lazily in pack_inputs.
+
+    def _allocate_workspaces(
+        self, max_rows: int, hidden: int, num_local_experts: int
+    ) -> None:
+        if self._permuted_input is not None:
+            return
+        from .megamoe_fc12 import (
+            Mxfp8Mxfp4Fc12Launcher,
+        )
+
+        self._permuted_input = torch.empty(
+            (max_rows, hidden),
+            dtype=torch.float8_e4m3fn,
+            device=self.device,
+        )
+        self._permuted_output = torch.empty(
+            (max_rows, hidden), dtype=torch.bfloat16, device=self.device
+        )
+        self._permuted_scales = torch.empty(
+            (max_rows, hidden // 32), dtype=torch.uint8, device=self.device
+        )
+        self._launcher = Mxfp8Mxfp4Fc12Launcher(
+            num_local_experts,
+            max_rows,
+            hidden,
+            self.config.experts.intermediate_size,
+        )
+
+    def get_valid_tactics(self, inputs: List[torch.Tensor], profile: Any) -> List[Any]:
+        self._require_built()
+        return [-1]
+
+    def pack_inputs(
+        self, act: MoEActivationPack, weights: MoEWeightPack
+    ) -> List[torch.Tensor]:
+        self._require_built()
+        if act.routing_input_mode not in self.supported_routing_modes:
+            raise NotImplementedError(
+                f"MegaMOE FC12 does not support {act.routing_input_mode!r}."
+            )
+        routing = self.config.routing
+        _validate_prerouted_inputs(
+            act,
+            act.num_tokens,
+            routing.top_k,
+            type(self).__name__,
+            allowed_weights_dtypes=(torch.float32, torch.bfloat16),
+            require_contiguous=True,
+        )
+        topk_ids, topk_weights = act.topk_ids, act.topk_weights
+        if act.num_tokens > self.config.execution.tune_max_num_tokens:
+            raise ValueError(
+                "MXFP8 x MXFP4 FC12 token count exceeds allocated capacity"
+            )
+        if act.hidden_states_q.dtype is not torch.float8_e4m3fn:
+            raise TypeError("MXFP8 x MXFP4 FC12 requires E4M3 activations")
+        sf = act.hidden_states_scale
+        if sf is None or sf.shape != (
+            act.hidden_states_q.shape[0],
+            act.hidden_states_q.shape[1] // 32,
+        ):
+            raise ValueError(
+                "MXFP8 x MXFP4 FC12 requires linear [tokens, hidden/32] scales"
+            )
+        if sf.dtype not in (
+            torch.uint8,
+            getattr(torch, "float8_e8m0fnu", torch.uint8),
+        ):
+            raise TypeError("MXFP8 x MXFP4 FC12 scales must be E8M0 bytes")
+        if topk_weights.dtype != torch.float32:
+            raise TypeError("MXFP8 x MXFP4 FC12 routing weights must be FP32")
+        if (
+            self._permuted_input is not None
+            and self._permuted_input.shape[1] != act.hidden_states_q.shape[1]
+        ):
+            raise ValueError(
+                "MXFP8 x MXFP4 FC12 hidden size cannot change after initialization"
+            )
+
+        view = weights.get_view(self.backend_key)
+        hidden = act.hidden_states_q.shape[1]
+        num_local_experts = self.config.experts.local_num_experts or routing.num_experts
+        if self._permuted_input is None:
+            from .cute_dsl.moe_utils import get_max_num_permuted_tokens
+
+            self._allocate_workspaces(
+                get_max_num_permuted_tokens(
+                    self.config.execution.tune_max_num_tokens,
+                    routing.top_k,
+                    num_local_experts,
+                    64,
+                ),
+                hidden,
+                num_local_experts,
+            )
+        output = torch.empty_like(act.hidden_states_q, dtype=torch.bfloat16)
+        # The EP RANK_MAJOR bridge represents remote picks as a valid local id
+        # with weight zero so generic runners never dereference -1.  FC12 owns
+        # its compact setup, so recover the sparse meaning before moe_sort:
+        # invalid ids are omitted from its expert histogram and permutation.
+        selected_experts = torch.where(
+            topk_weights != 0,
+            topk_ids,
+            torch.full_like(topk_ids, -1),
+        )
+        packed = [
+            act.hidden_states_q,
+            selected_experts,
+            topk_weights,
+            view["fc1_weight"],
+            view["fc2_weight"],
+            output,
+        ]
+        packed.extend((view["fc1_weight_sf"], view["fc2_weight_sf"]))
+        packed.append(act.hidden_states_scale)
+        return packed
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: Any = -1,
+        do_preparation: bool = False,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        del do_preparation, kwargs
+        self._require_built()
+        if tactic != -1 or len(inputs) != 9:
+            raise ValueError("MegaMOE FC12 expects tactic -1 and nine tensors.")
+        assert self._sort_buffers is not None
+        assert self._permuted_input is not None
+        assert self._permuted_output is not None
+        assert self._launcher is not None
+        from .cute_dsl.moe_utils import moe_permute, moe_sort
+
+        hidden_states, topk_ids, topk_weights, fc1_weight, fc2_weight, output = inputs[
+            :6
+        ]
+        routing = self.config.routing
+        (
+            tile_idx_to_expert_idx,
+            tile_idx_to_mn_limit,
+            expanded_idx_to_permuted_idx,
+            permuted_idx_to_expanded_idx,
+            total_num_padded_tokens,
+            num_non_exiting_tiles,
+        ) = moe_sort(
+            topk_ids,
+            topk_weights,
+            num_experts=routing.num_experts,
+            top_k=routing.top_k,
+            local_expert_offset=self.config.experts.local_expert_offset,
+            num_local_experts=self.config.experts.local_num_experts,
+            tile_tokens_dim=64,
+            enable_pdl=self._enable_pdl,
+            **self._sort_buffers,
+        )
+        moe_permute(
+            hidden_states,
+            self._permuted_input,
+            tile_idx_to_mn_limit,
+            permuted_idx_to_expanded_idx,
+            num_non_exiting_tiles,
+            self._permuted_input.shape[0],
+            routing.top_k,
+            64,
+            enable_pdl=self._enable_pdl,
+        )
+        from .megamoe_fc12 import (
+            Mxfp8Mxfp4Fc12Inputs,
+            mxfp8_mxfp4_expert_counts,
+            unpermute_mxfp8_mxfp4_routes,
+        )
+
+        assert self._permuted_scales is not None
+        local_expert_counts = mxfp8_mxfp4_expert_counts(
+            topk_ids,
+            self.config.experts.local_expert_offset,
+            self.config.experts.local_num_experts or routing.num_experts,
+        )
+        # The shared FP8 permutation utility does not promise a linear
+        # E8M0/K32 output ABI. Gather raw bytes using its exact row map;
+        # padding is not consumed and is clamped to avoid invalid reads.
+        if hidden_states.shape[0] == 0:
+            output.zero_()
+            return output
+        source_rows = (
+            (permuted_idx_to_expanded_idx // routing.top_k)
+            .clamp(min=0, max=hidden_states.shape[0] - 1)
+            .long()
+        )
+        torch.index_select(
+            inputs[8].view(torch.uint8), 0, source_rows, out=self._permuted_scales
+        )
+        self._launcher.run(
+            Mxfp8Mxfp4Fc12Inputs(
+                self._permuted_input,
+                fc1_weight,
+                fc2_weight,
+                self._permuted_output,
+                local_expert_counts,
+                inputs[6],
+                inputs[7],
+                self._permuted_scales,
+            )
+        )
+        unpermute_mxfp8_mxfp4_routes(
+            self._permuted_output,
+            output,
+            expanded_idx_to_permuted_idx,
+            topk_weights,
+        )
+        return output
+
+
 def __getattr__(name: str):
     if name == "CuteDslNvfp4Runner":
         warnings.warn(
