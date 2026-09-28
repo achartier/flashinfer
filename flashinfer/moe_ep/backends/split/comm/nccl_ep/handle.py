@@ -361,6 +361,7 @@ class NcclEpHandle(Handle):
 
     def dispatch(self, params: DispatchInputParams) -> DispatchOutput:
         x = params.x[0]
+        self._validate_padding_stream(x)
         # The activation count must match the routing the handle currently
         # holds. A mismatch passes the per-path capacity guards and reaches
         # NCCL-EP, which indexes routing by row.
@@ -375,7 +376,37 @@ class NcclEpHandle(Handle):
             return self._dispatch_ht(x)
         if self._is_rank_major:
             return self._dispatch_ll_rank_major(x)
-        return self._dispatch_ll(x)
+        from .....core.comm.padding import pad_ll_rows
+
+        fp = self._fleet.params
+        padded = (
+            fp.transport_hidden_size is not None and x.shape[-1] == fp.token_hidden_size
+        )
+        result = self._dispatch_ll(
+            pad_ll_rows(x, fp.combine_hidden_size) if padded else x
+        )
+        if padded:
+            from dataclasses import replace
+
+            result = replace(
+                result,
+                expert_tensors=result.expert_tensors[
+                    ..., : fp.token_hidden_size
+                ].contiguous(),
+            )
+        return result
+
+    def _validate_padding_stream(self, x) -> None:
+        # The padding/crop copies are Torch operations on the current stream.
+        # Keep them ordered with NCCL instead of silently racing an explicit
+        # foreign HandleAlgoKnobUserStream. Graph capture already uses current.
+        if self._fleet.params.transport_hidden_size is not None and x.is_cuda:
+            import torch
+
+            if self._op_stream() != torch.cuda.current_stream(x.device).cuda_stream:
+                raise ValueError(
+                    "LL transport padding requires the NCCL operation stream to be current"
+                )
 
     def _dispatch_ll(self, x) -> DispatchOutput:
         import torch
@@ -661,6 +692,7 @@ class NcclEpHandle(Handle):
         import torch
 
         x = params.x[0]
+        self._validate_padding_stream(x)
         hidden = self._fleet.params.token_hidden_size
         out_t = (
             params.out
@@ -721,6 +753,11 @@ class NcclEpHandle(Handle):
         if weights.dtype != torch.float32:
             weights = weights.to(torch.float32)
         weights_t = self._wrap(weights)
+        from .....core.comm.padding import finish_ll_combine, prepare_ll_combine
+
+        x, wire_out, out_t = prepare_ll_combine(
+            x, out_t, self._fleet.params, self._num_tokens_in
+        )
         ck = ("ll_comb_cfg", self._staged)
         config = self._hot.get(ck)
         if config is None:
@@ -731,7 +768,11 @@ class NcclEpHandle(Handle):
         # buffer (a graph state does; the default forward's empty_like does
         # not). Caching a per-call buffer retains one output per forward until
         # the bounded cache is cleared -- see _wrap.
-        out_w = self._wrap(out_t) if out_is_stable else self._ep.Tensor(out_t)
+        out_w = (
+            self._wrap(wire_out)
+            if out_is_stable and wire_out is out_t
+            else self._ep.Tensor(wire_out)
+        )
         outputs = self._ep.CombineOutputs(
             tokens=out_w,
             topk_weights=weights_t,
@@ -744,7 +785,7 @@ class NcclEpHandle(Handle):
         self._combine_inputs = inputs
         self._combine_outputs = outputs
         self._combine_weights = weights
-        return CombineOutput(x=out_t)
+        return CombineOutput(x=finish_ll_combine(wire_out, out_t))
 
     def complete(self) -> None:
         """No-op in non-staged LL mode."""

@@ -15,8 +15,8 @@ the runner with ``do_finalize=True`` at ``top_k=1`` is an identity-order scatter
 output comes back in the same row order and reshapes straight back to the 3D combine
 layout via :func:`reshape_for_combine`.
 
-Padded rows beyond the per-expert ``recv_count`` compute garbage that ``combine`` never
-gathers — correct, at a perf cost that a future recv_count-aware grouping can remove.
+When ``expert_counts`` is supplied, padded rows beyond each expert's receive
+count are masked before sorting so the lean FC12 kernel does not compute them.
 
 For the LL **RANK_MAJOR** layout the recv buffer is instead
 ``[world, max_tokens_per_rank, hidden]`` (tokens grouped by source rank, each
@@ -40,7 +40,7 @@ _NCCL_EP_LL_BF16_WIDTHS = (2048, 2560, 4096, 5120, 6144, 7168, 8192)
 
 def packed_mxfp8_dispatch_width(hidden: int) -> int:
     """Return the smallest supported BF16 row that holds MXFP8 data + scales."""
-    if hidden % 64:
+    if hidden <= 0 or hidden % 64:
         raise ValueError(f"mxfp8_dispatch requires hidden % 64 == 0, got {hidden}")
     need = (hidden + hidden // 32) // 2
     for width in _NCCL_EP_LL_BF16_WIDTHS:
@@ -72,6 +72,7 @@ def pack_mxfp8_dispatch_payload(x: torch.Tensor) -> torch.Tensor:
 def build_activation_pack(
     expert_tensors: torch.Tensor,
     *,
+    expert_counts: Optional[torch.Tensor] = None,
     local_expert_offset: int = 0,
     quant: "QuantConfig",
     per_token_activation: bool = False,
@@ -115,6 +116,14 @@ def build_activation_pack(
         row_expert.repeat_interleave(cap).reshape(m, 1) + local_expert_offset
     )
     final_scales = torch.ones(m, 1, dtype=torch.float32, device=device)
+    if expert_counts is not None:
+        if expert_counts.shape != (num_local_experts,):
+            raise ValueError("expert_counts must have one entry per local expert")
+        valid = (
+            torch.arange(cap, device=device)[None, :] < expert_counts[:, None]
+        ).reshape(m, 1)
+        selected_experts = torch.where(valid, selected_experts, -1)
+        final_scales = torch.where(valid, final_scales, 0.0)
 
     return _quantize_and_pack(
         flat,

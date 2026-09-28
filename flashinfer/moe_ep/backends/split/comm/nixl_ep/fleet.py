@@ -133,7 +133,7 @@ class NixlEpFleet(FaultToleranceMixin, Fleet):
         # num_rdma_bytes — size the per-rank RDMA buffer via the upstream hint.
         num_rdma_bytes = nixl_ep.Buffer.get_rdma_size_hint(
             params.max_tokens_per_rank,
-            params.token_hidden_size,
+            params.combine_hidden_size,
             cap,
             params.num_experts,
         )

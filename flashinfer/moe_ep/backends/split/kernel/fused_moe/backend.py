@@ -35,6 +35,15 @@ class FusedMoeSplitKernelBackend(SplitKernelBackend):
         self._moe_config = config.moe_config
         self._mxfp8_dispatch = config.mxfp8_dispatch
         self._compute: Optional["MoELayer"] = None
+        from ......fused_moe.api import MegaMoeFc12Config, QuantFormat
+
+        self._mask_padding = self._moe_config.quant.pair == (
+            QuantFormat.MXFP4,
+            QuantFormat.MXFP8,
+        ) and any(
+            isinstance(candidate, MegaMoeFc12Config)
+            for candidate in self._moe_config.backend
+        )
 
     @classmethod
     def kernel_name(cls) -> str:
@@ -47,7 +56,11 @@ class FusedMoeSplitKernelBackend(SplitKernelBackend):
     ) -> None:
         validate_compute_consistency(fleet_params, bootstrap, self._moe_config)
         if self._mxfp8_dispatch:
-            from ......fused_moe.api import CuteDslConfig, QuantFormat
+            from ......fused_moe.api import (
+                CuteDslConfig,
+                MegaMoeFc12Config,
+                QuantFormat,
+            )
             from .....core.validation.common import MoEEpConfigError
 
             if self._moe_config.quant.pair != (
@@ -58,10 +71,32 @@ class FusedMoeSplitKernelBackend(SplitKernelBackend):
                     "mxfp8_dispatch requires MoEConfig quant pair MXFP4×MXFP8."
                 )
             backends = tuple(self._moe_config.backend)
-            if len(backends) != 1 or not isinstance(backends[0], CuteDslConfig):
+            if len(backends) != 1 or not isinstance(
+                backends[0], (CuteDslConfig, MegaMoeFc12Config)
+            ):
                 raise MoEEpConfigError(
-                    "mxfp8_dispatch requires exactly one CuteDslConfig backend."
+                    "mxfp8_dispatch requires exactly one CuteDslConfig or MegaMoeFc12Config backend."
                 )
+
+        from ......fused_moe.api import MegaMoeFc12Config, QuantFormat
+
+        if (
+            self._moe_config.quant.pair == (QuantFormat.MXFP4, QuantFormat.MXFP8)
+            and any(
+                isinstance(backend, MegaMoeFc12Config)
+                for backend in self._moe_config.backend
+            )
+            and (
+                fleet_params.layout is EpLayout.RANK_MAJOR
+                or fleet_params.algorithm is EpAlgorithm.HIGH_THROUGHPUT
+            )
+        ):
+            from .....core.validation.common import MoEEpConfigError
+
+            raise MoEEpConfigError(
+                "MXFP8 x MXFP4 FC12 requires route-preserving combine: RANK_MAJOR/HT "
+                "currently round local weighted partial sums to BF16 before remote reduction."
+            )
 
     def pack_dispatch_payload(self, x):
         if not self._mxfp8_dispatch:
@@ -125,6 +160,7 @@ class FusedMoeSplitKernelBackend(SplitKernelBackend):
         else:
             act_pack = build_activation_pack(
                 expert_tensors,
+                expert_counts=ctx.expert_counts if self._mask_padding else None,
                 local_expert_offset=offset,
                 quant=quant,
                 per_token_activation=per_token_activation,

@@ -211,7 +211,7 @@ class NcclEpFleet(FaultToleranceMixin, Fleet):
             algorithm=_map_algorithm(p.algorithm),
             num_experts=p.num_experts,
             max_dispatch_tokens_per_rank=p.max_tokens_per_rank,
-            max_token_bytes=p.token_hidden_size * p.dtype_bytes,
+            max_token_bytes=p.combine_hidden_size * p.dtype_bytes,
             rdma_buffer_size=self._knob_or_auto(FleetAlgoKnobRdmaBufferSize, "bytes_"),
             num_qp_per_rank=self._knob_or_auto(FleetAlgoKnobNumQpsPerRank, "n"),
             num_channels=self._knob_or_auto(FleetAlgoKnobNumChannelsPerRank, "n"),

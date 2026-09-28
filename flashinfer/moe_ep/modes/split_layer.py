@@ -353,6 +353,16 @@ class MoEEpSplitLayer(nn.Module):
             return
         validate_arch_for_backend(backend_name)
         fleet_knobs = _index_knobs(self._fleet_knobs)
+        quant_knob = fleet_knobs.get(FleetAlgoKnobQuantization)
+        if (
+            getattr(self._kernel_config, "mxfp8_dispatch", False)
+            and quant_knob is not None
+            and quant_knob.quants
+        ):
+            raise ValueError(
+                "mxfp8_dispatch carries opaque FP8/E8M0 bytes in BF16 rows; "
+                "FleetAlgoKnobQuantization must be disabled to avoid corrupting the payload."
+            )
         cap_knob = fleet_knobs.get(FleetAlgoKnobTopologyCapacity)
         topology_capacity = (
             int(cap_knob.n) if cap_knob is not None else None  # type: ignore[attr-defined]
@@ -494,6 +504,7 @@ class MoEEpSplitLayer(nn.Module):
     def _inner_compute(self, dispatch: DispatchOutput) -> torch.Tensor:
         ctx = SplitKernelContext(
             expert_tensors=dispatch.expert_tensors,
+            expert_counts=dispatch.expert_counts,
             num_tokens=dispatch.get_num_tokens(),
             fleet_params=self._fleet_params,
             recv_topk_idx=dispatch.recv_topk_idx,
