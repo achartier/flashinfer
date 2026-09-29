@@ -169,10 +169,13 @@ def compute_idesc(
 ) -> Int32:
     """OR runtime N and scale-factor data IDs into a static descriptor."""
     idesc = Int32(static_base) | (Int32(n_dim_value) << _BIT_N_DIM)
-    sfa_top = Int32(sfa_tmem_addr_i32) & Int32(0xC0000000)
-    sfb_top = Int32(sfb_tmem_addr_i32) & Int32(0xC0000000)
-    idesc = idesc | (sfa_top >> Int32(30 - _BIT_A_SF_ID))
-    idesc = idesc | (sfb_top >> Int32(30 - _BIT_B_SF_ID))
+    # Shift first, then mask: Int32 ``>>`` is arithmetic, so shifting the
+    # masked top bits sign-extends ones over the descriptor whenever bit 31
+    # is set (scale-factor IDs 2 and 3, i.e. K steps 2 and 3 of a K tile).
+    sfa_id = (Int32(sfa_tmem_addr_i32) >> Int32(30)) & Int32(0x3)
+    sfb_id = (Int32(sfb_tmem_addr_i32) >> Int32(30)) & Int32(0x3)
+    idesc = idesc | (sfa_id << Int32(_BIT_A_SF_ID))
+    idesc = idesc | (sfb_id << Int32(_BIT_B_SF_ID))
     return idesc
 
 
