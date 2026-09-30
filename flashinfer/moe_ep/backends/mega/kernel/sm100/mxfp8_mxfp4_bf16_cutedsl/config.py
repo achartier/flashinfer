@@ -106,8 +106,9 @@ def default_tactic(max_tokens_per_rank: int) -> Mxfp8Mxfp4Tactic:
     T256-4096 global) the pair measured 1.35-1.60x faster than N128 with the
     SM-count group budget.  At 1024+ tokens per rank, N128 with
     ``group_hint=512`` measured 2-5% faster than N128 with 4096 (and N64
-    lost), since smaller groups let FC2 overlap the next group's FC1.  N256
-    and ``atomic_counter`` scheduling do not run in the persistent kernel yet.
+    lost), since smaller groups let FC2 overlap the next group's FC1. N256
+    is unsupported. ``atomic_counter`` is an explicit override; static remains
+    the measured default pending multi-rank validation and atomic-mode timing.
 
     ``num_stages="auto"`` resolves at compile time to the deepest operand
     pipeline that fits shared memory for the actual geometry; pin an integer
@@ -136,8 +137,8 @@ def candidate_tactics() -> list[Mxfp8Mxfp4Tactic]:
     """Bounded search over supported geometry and measured scheduling settings.
 
     GB200 round-2 experiments established N64 and larger expert groups as
-    useful axes. Do not reintroduce N256 or atomic-counter scheduling here:
-    the former is rejected by the assembly and the latter fails DSL lowering.
+    useful axes. N256 is rejected by the assembly. Atomic-counter scheduling
+    remains opt-in pending multi-rank correctness and performance validation.
     Include auto depth so tuning cannot omit the shipped default (which fits
     more than four operand stages for the MAI geometry).
     """

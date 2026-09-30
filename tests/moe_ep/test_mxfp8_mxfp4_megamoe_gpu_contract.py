@@ -142,7 +142,7 @@ def test_mxfp8_mxfp4_megamoe_frontend_requires_warmup_before_graph_capture() -> 
         frontend.run(missed)
 
 
-def _full_kernel_case(tokens, hidden, intermediate, experts, topk):
+def _full_kernel_case(tokens, hidden, intermediate, experts, topk, *, knobs=None):
     from flashinfer.moe_ep.cute_dsl.megamoe.mxfp8_mxfp4.integration import (
         get_symm_buffer_for_mxfp8_mxfp4_mega_moe,
         mxfp8_mxfp4_mega_moe,
@@ -192,6 +192,7 @@ def _full_kernel_case(tokens, hidden, intermediate, experts, topk):
         intermediate,
         0,
         1,
+        knobs=knobs,
     )
     workspace.x[:tokens].copy_(xq)
     workspace.x_sf[:tokens].view(torch.uint8).copy_(xs)
@@ -207,6 +208,7 @@ def _full_kernel_case(tokens, hidden, intermediate, experts, topk):
 
 
 @pytest.mark.arch_blackwell
+@pytest.mark.parametrize("load_balance_mode", ["static", "atomic_counter"])
 @pytest.mark.parametrize(
     "shape",
     [
@@ -216,9 +218,13 @@ def _full_kernel_case(tokens, hidden, intermediate, experts, topk):
         (0, 128, 128, 2, 1),
     ],
 )
-def test_mxfp8_mxfp4_megamoe_full_kernel_boundary_shapes(shape) -> None:
+def test_mxfp8_mxfp4_megamoe_full_kernel_boundary_shapes(
+    shape, load_balance_mode
+) -> None:
     _require_b200()
-    workspace, launch, expected = _full_kernel_case(*shape)
+    workspace, launch, expected = _full_kernel_case(
+        *shape, knobs={"load_balance_mode": load_balance_mode}
+    )
     try:
         for _ in range(3):
             actual = launch()
@@ -229,14 +235,40 @@ def test_mxfp8_mxfp4_megamoe_full_kernel_boundary_shapes(shape) -> None:
 
 
 @pytest.mark.arch_blackwell
-def test_mxfp8_mxfp4_megamoe_full_kernel_cuda_graph_replay() -> None:
+@pytest.mark.parametrize("load_balance_mode", ["static", "atomic_counter"])
+@pytest.mark.parametrize(
+    "tokens,tile_tokens,cluster_shape",
+    [
+        (33, 64, (1, 1, 1)),
+        # More tiles than resident clusters exercises repeated atomic claims.
+        (4097, 128, (1, 1, 1)),
+        (129, 128, (2, 1, 1)),
+    ],
+)
+def test_mxfp8_mxfp4_megamoe_full_kernel_cuda_graph_replay(
+    load_balance_mode, tokens, tile_tokens, cluster_shape
+) -> None:
     _require_b200()
-    workspace, launch, expected = _full_kernel_case(33, 256, 256, 4, 2)
+    workspace, launch, expected = _full_kernel_case(
+        tokens,
+        256,
+        256,
+        4,
+        2,
+        knobs={
+            "load_balance_mode": load_balance_mode,
+            "mma_tiler_mnk": (128, tile_tokens, 128),
+            "cluster_shape_mnk": cluster_shape,
+            "group_hint": 1,
+        },
+    )
     try:
         capture_stream = torch.cuda.Stream()
         capture_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(capture_stream):
             baseline = launch().clone()
+            for _ in range(2):
+                torch.testing.assert_close(launch(), expected, atol=0.015, rtol=0.05)
         torch.cuda.synchronize()
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, stream=capture_stream):
