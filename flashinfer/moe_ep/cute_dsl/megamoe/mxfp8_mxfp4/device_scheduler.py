@@ -503,6 +503,7 @@ class PersistentDeviceScheduler:
         smem,
         producer_state,
         storage,
+        cluster_pipeline,
     ):
         self.params = params
         self.num_persistent_clusters = num_persistent_clusters
@@ -516,7 +517,7 @@ class PersistentDeviceScheduler:
         self._smem = smem
         self._producer_state = producer_state
         self._storage = storage
-        self._cluster_pipeline = None
+        self._cluster_pipeline = cluster_pipeline
         self._first_claim_pending = False
 
     @staticmethod
@@ -624,7 +625,19 @@ class PersistentDeviceScheduler:
         )
 
         atomic_state = None
+        cluster_pipeline = None
         if const_expr(params.load_balance_mode == "atomic_counter"):
+            # Initialize with the other pipelines, before the driver's
+            # pipeline_init_arrive/wait publishes the mbarriers to peers.
+            cluster_pipeline = pipeline.PipelineAsync.create(
+                num_stages=1,
+                producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
+                consumer_group=pipeline.CooperativeGroup(
+                    pipeline.Agent.Thread, 32 * cluster_size
+                ),
+                barrier_storage=storage.cluster_mbar.data_ptr(),
+                defer_sync=True,
+            )
             atomic_state = _AtomicClaimState(
                 params.load_balance_counter_ptr,
                 storage.cluster_claim.data_ptr(),
@@ -653,6 +666,7 @@ class PersistentDeviceScheduler:
             smem,
             producer_state,
             storage,
+            cluster_pipeline,
         )
 
     @property
@@ -679,21 +693,8 @@ class PersistentDeviceScheduler:
     @dsl_user_op
     @cute.jit
     def internal_init(self, warp_idx, sched_warp_id: int, *, loc=None, ip=None):
-        """Overlap the first claim/decode with the kernel's init barriers."""
+        """Prime the scheduler after dispatch has reset counters and counts."""
         if const_expr(self.params.load_balance_mode == "atomic_counter"):
-            cluster_size = (
-                self.params.cluster_shape_token_feature[0]
-                * self.params.cluster_shape_token_feature[1]
-            )
-            self._cluster_pipeline = pipeline.PipelineAsync.create(
-                num_stages=1,
-                producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
-                consumer_group=pipeline.CooperativeGroup(
-                    pipeline.Agent.Thread, 32 * cluster_size
-                ),
-                barrier_storage=self._storage.cluster_mbar.data_ptr(),
-                defer_sync=True,
-            )
             if warp_idx == sched_warp_id:
                 tidx, _, _ = cute.arch.thread_idx(loc=loc, ip=ip)
                 claimed = Int32(0)

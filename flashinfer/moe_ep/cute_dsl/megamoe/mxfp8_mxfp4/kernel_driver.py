@@ -590,9 +590,9 @@ class PersistentM128DeviceDriver:
         if cutlass.const_expr(stats is not None):
             entry = globaltimer_lo()
 
-        # Atomic scheduling constructs a cluster pipeline on every thread;
-        # static scheduling only mutates state on the scheduler warp.  Calling
-        # the common initializer before role splitting is correct for both.
+        # Both schedulers prime their state on the scheduler warp, after
+        # dispatch publishes counts and resets the atomic claim counter.
+        # Their pipelines were constructed before the init fence above.
         if cutlass.const_expr(self.dispatch_phase is not None):
             if warp_idx == self.warp_ids.scheduler:
                 if cutlass.const_expr(stats is not None):
@@ -615,6 +615,10 @@ class PersistentM128DeviceDriver:
                     stats, Slot.SCHED_INIT_DONE_AT_NS, globaltimer_lo() - entry
                 )
 
+        # Capture immutable consumer parameters before tracing the scheduler
+        # branch. Its first atomic decode rebinds scheduler.params through
+        # SCF results; those branch-local values cannot feed a sibling warp.
+        scheduler_params = scheduler_bundle.scheduler.params
         if warp_idx == self.warp_ids.scheduler:
             cute.arch.warpgroup_reg_dealloc(self.task_registers)
             self._run_scheduler(scheduler_bundle.scheduler, stats, entry)
@@ -636,7 +640,7 @@ class PersistentM128DeviceDriver:
                 ab_producer=mainloop_pipelines.ab_producer,
                 operand_smem=operand_smem,
                 views=views,
-                scheduler_params=scheduler_bundle.scheduler.params,
+                scheduler_params=scheduler_params,
                 fc1_k_tiles=fc1_k_tiles,
                 fc2_k_tiles=fc2_k_tiles,
                 stats=stats,
