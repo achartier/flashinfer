@@ -125,23 +125,22 @@ class Mxfp8DispatchPhase:
             stats_offsets = _dispatch_stats_word_offsets(self.config)
             if stats_offsets is not None:
                 comm_class = _timed_token_comm_class(comm_class)
-            self._token_comm = comm_class(
-                world_size=self.config.world_size,
-                num_topk=self.config.num_topk,
-                num_experts_per_rank=self.config.num_experts_per_rank,
-                num_total_experts=self.config.num_total_experts,
-                hidden=self.config.hidden,
-                fc1_token_dtype=cutlass.Float8E4M3FN,
-                sf_uint32_per_token=self.config.sf_uint32_per_token,
-                token_padding_block=self.config.token_padding_block,
-                sf_padding_block=self.config.sf_padding_block,
-                cluster_tile_tokens=self.config.cluster_tile_tokens,
+            from .token_comm import make_token_comm_binding
+
+            binding = make_token_comm_binding(
+                self.config,
                 cluster_shape_mn=self.cluster_shape_mn,
                 dispatch_warp_start=self.dispatch_warp_start,
                 num_other_warps=self.num_other_warps,
                 flag_batch=self.flag_batch,
-                is_swap_ab=True,
-                token_back_by_dispatch=False,
+                # The helper's historical N name denotes the output-feature
+                # extent. Swap-AB uses M128 per CTA, replicated along cluster M.
+                fc2_n_tile=128 * self.cluster_shape_mn[0],
+            )
+            self._token_comm = binding.instantiate(
+                helper_type=comm_class,
+                fc1_token_dtype=cutlass.Float8E4M3FN,
+                combine_format=None,
             )
             if stats_offsets is not None:
                 self._token_comm.stats_word_offsets = stats_offsets

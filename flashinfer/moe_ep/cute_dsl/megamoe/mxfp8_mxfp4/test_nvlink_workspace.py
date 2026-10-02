@@ -90,3 +90,35 @@ def test_legacy_standalone_phase_stays_single_rank():
             dispatch_warp_start=0,
             num_other_warps=8,
         )
+
+
+@pytest.mark.parametrize("cluster_shape", [(1, 1), (2, 1), (1, 2)])
+@pytest.mark.parametrize("schedule", ["static", "atomic_counter"])
+def test_dispatch_reuse_binds_fc2_publication_and_schedule(cluster_shape, schedule):
+    config = WorkspaceConfig(
+        world_size=1,
+        num_topk=2,
+        num_experts_per_rank=4,
+        max_tokens_per_rank=129,
+        hidden=512,
+        intermediate=256,
+        token_padding_block=64,
+        sf_padding_block=128,
+        cluster_tile_tokens=64 * cluster_shape[1],
+        token_back_by_dispatch=True,
+        token_back_schedule_mode=schedule,
+    )
+    phase = Mxfp8DispatchPhase(
+        config,
+        rank=0,
+        cluster_shape_mn=cluster_shape,
+        dispatch_warp_start=8,
+        num_other_warps=8,
+    )
+    helper = phase.token_comm
+    assert helper.enable_token_back
+    assert helper.token_back_by_dispatch
+    assert not helper.token_back_standalone
+    assert not helper.token_back_reduce_topk
+    assert helper.token_back_schedule_mode == schedule
+    assert helper.fc2_publishes_per_token_cluster_tile == 4 * cluster_shape[1]
