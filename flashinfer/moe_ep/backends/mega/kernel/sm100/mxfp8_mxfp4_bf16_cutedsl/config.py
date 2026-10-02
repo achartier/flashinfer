@@ -88,7 +88,10 @@ def validate_tactic(tactic: dict, *, partial: bool = True) -> None:
         "epi_warps",
         "reuse_dispatch_warps",
     ):
-        raise ValueError("unsupported token_back_mode")
+        raise ValueError(
+            "token_back_mode must be epi_warps or reuse_dispatch_warps; "
+            "standalone_warps is unsupported"
+        )
     if tactic.get("token_back_schedule_mode", "static") not in (
         "static",
         "atomic_counter",

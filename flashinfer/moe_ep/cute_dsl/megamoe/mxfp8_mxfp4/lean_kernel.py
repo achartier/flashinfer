@@ -223,6 +223,9 @@ class LeanFc12Launcher(PersistentFc12KernelBase):
             local_zero_prefix=None,
             shared_zero_prefix=None,
             load_balance_counter=None,
+            fc2_output_workspace=None,
+            fc2_done_counter=None,
+            token_back_schedule_counter=None,
             peer_rank_ptr_mapper_host=None,
             stream=cuda.CUstream(
                 torch.cuda.current_stream(inputs.activation.device).cuda_stream

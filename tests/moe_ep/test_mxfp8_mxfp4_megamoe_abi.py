@@ -4,6 +4,11 @@
 
 from __future__ import annotations
 
+import pytest
+
+from flashinfer.moe_ep.backends.mega.kernel.sm100.mxfp8_mxfp4_bf16_cutedsl.config import (
+    resolve_tactic,
+)
 from flashinfer.moe_ep.cute_dsl.megamoe.mxfp8_mxfp4.scheduler import (
     AtomicTileClaimer,
     PersistentFc1Fc2Scheduler,
@@ -18,6 +23,21 @@ from flashinfer.moe_ep.cute_dsl.megamoe.mxfp8_mxfp4.workspace import (
     make_workspace_plan,
     sf_uint32_per_token,
 )
+
+
+@pytest.mark.parametrize("mode", ["epi_warps", "reuse_dispatch_warps"])
+@pytest.mark.parametrize("schedule", ["static", "atomic_counter"])
+def test_mxfp8_mxfp4_token_back_tactic_contract(mode, schedule):
+    tactic = resolve_tactic(
+        129, {"token_back_mode": mode, "token_back_schedule_mode": schedule}
+    )
+    assert tactic["token_back_mode"] == mode
+    assert tactic["token_back_schedule_mode"] == schedule
+
+
+def test_mxfp8_mxfp4_rejects_standalone_token_back():
+    with pytest.raises(ValueError, match="standalone_warps is unsupported"):
+        resolve_tactic(129, {"token_back_mode": "standalone_warps"})
 
 
 def _scheduler() -> PersistentFc1Fc2Scheduler:
