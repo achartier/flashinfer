@@ -251,6 +251,9 @@ class _MegaAdapterBindings:
             stream=cuda.CUstream(spec.stream),
             expert_data_row_offsets=None,
             expert_scale_row_offsets=None,
+            fc2_output_workspace=v.get("fc2_output_workspace"),
+            fc2_done_counter=v.get("fc2_done_counter"),
+            token_back_schedule_counter=v.get("token_back_schedule_counter"),
         )
 
 
@@ -387,6 +390,7 @@ class PersistentFc12KernelBase:
         fc2_threshold = (2 * config.intermediate + m * cm - 1) // (m * cm)
         load_balance_mode = self.tactic["load_balance_mode"]
         flag_batch = self.tactic["flag_batch"]
+        token_back_by_dispatch = mega and wc.token_back_by_dispatch
         num_stages = self.tactic["num_stages"]
         if num_stages == "auto":
             num_stages = self._fit_operand_stages(
@@ -541,6 +545,22 @@ class PersistentFc12KernelBase:
                     cpasync.prefetch_descriptor(atom)
                 for atom in phase2[::2]:
                     cpasync.prefetch_descriptor(atom)
+            fc2_store = Fc2RouteStore(
+                route_terms,
+                dispatch_args.peer_rank_ptr_mapper if mega else None,
+            )
+            if cutlass.const_expr(token_back_by_dispatch):
+                # Stage unweighted BF16 rows in expert-pool order. Dispatch
+                # warps resolve source metadata only when pushing the rows.
+                fc2_store = Fc2RouteStore(
+                    cute.make_tensor(
+                        dispatch_args.fc2_output_workspace.iterator,
+                        cute.make_layout(
+                            (pool_tokens, 1, config.hidden),
+                            stride=(config.hidden, 0, 1),
+                        ),
+                    )
+                )
             PersistentM128DeviceDriver(
                 kernel_pipelines=pipes, stats_word_offset=stats_word_offset
             )(
@@ -554,12 +574,18 @@ class PersistentFc12KernelBase:
                     fc2=pv2,
                     fc1_output=fc1_output,
                     fc1_output_scales=fc1_output_sf_logical,
-                    route_store=Fc2RouteStore(
-                        route_terms,
-                        dispatch_args.peer_rank_ptr_mapper if mega else None,
-                    ),
+                    route_store=fc2_store,
                     fc1_done_counter=fc1_done_counter,
-                    token_metadata=dispatch_args.token_src_metadata if mega else None,
+                    token_metadata=(
+                        dispatch_args.token_src_metadata
+                        if mega and not token_back_by_dispatch
+                        else None
+                    ),
+                    fc2_done_counter=(
+                        dispatch_args.fc2_done_counter
+                        if token_back_by_dispatch
+                        else None
+                    ),
                 ),
                 dispatch_args=dispatch_args,
                 dispatch_storage=storage.dispatch if mega else None,
@@ -605,6 +631,9 @@ class PersistentFc12KernelBase:
                 stream,
                 expert_data_row_offsets,
                 expert_scale_row_offsets,
+                fc2_output_workspace,
+                fc2_done_counter,
+                token_back_schedule_counter,
             ):
                 # Descriptor construction belongs to this enclosing JIT trace.
                 staging = Mxfp8Mxfp4TmaStaging(
@@ -635,6 +664,10 @@ class PersistentFc12KernelBase:
                         local_zero_prefix,
                         shared_zero_prefix,
                         peer_rank_ptr_mapper_host,
+                        route_terms,
+                        fc2_output_workspace,
+                        fc2_done_counter,
+                        token_back_schedule_counter,
                     )
                     counts_i32 = cute.recast_tensor(
                         expert_recv_count_sum, cutlass.Int32
@@ -763,6 +796,10 @@ class PersistentFc12KernelBase:
                 local_zero_prefix,
                 shared_zero_prefix,
                 peer_rank_ptr_mapper_host,
+                route_terms,
+                fc2_output_workspace,
+                fc2_done_counter,
+                token_back_schedule_counter,
             ):
                 dispatch = Mxfp8DispatchPhase(
                     wc,
@@ -787,7 +824,15 @@ class PersistentFc12KernelBase:
                     fc1_input_topk_weights_buffer=l1_topk_weights_buffer,
                     fc1_ready_counter=l1_arrival_count,
                     token_src_metadata=token_src_metadata,
-                    combine_output=l1_token_buffer,
+                    # The helper offsets combine_output in bytes.
+                    combine_output=cute.recast_tensor(route_terms, cutlass.Uint8),
+                    fc2_output_workspace=fc2_output_workspace,
+                    fc2_done_counter=fc2_done_counter,
+                    token_back_schedule_counter=(
+                        token_back_schedule_counter.iterator
+                        if token_back_schedule_counter is not None
+                        else None
+                    ),
                     nvlink_barrier_signal=nvlink_barrier_signal,
                     nvlink_barrier_counter=nvlink_barrier_counter,
                     grid_sync_counter=grid_sync_counter,

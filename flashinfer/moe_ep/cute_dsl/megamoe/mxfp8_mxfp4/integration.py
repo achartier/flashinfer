@@ -273,7 +273,7 @@ def get_symm_buffer_for_mxfp8_mxfp4_mega_moe(
         sf_padding_block=128,
         cluster_tile_tokens=cluster_tokens,
         load_balance_mode=tactic["load_balance_mode"],
-        token_back_by_dispatch=False,
+        token_back_by_dispatch=tactic["token_back_mode"] == "reuse_dispatch_warps",
         token_back_schedule_mode=tactic["token_back_schedule_mode"],
     )
     plan = make_workspace_plan(workspace_config)

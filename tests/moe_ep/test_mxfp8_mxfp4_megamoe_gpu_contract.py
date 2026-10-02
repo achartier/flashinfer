@@ -210,6 +210,14 @@ def _full_kernel_case(tokens, hidden, intermediate, experts, topk, *, knobs=None
 @pytest.mark.arch_blackwell
 @pytest.mark.parametrize("load_balance_mode", ["static", "atomic_counter"])
 @pytest.mark.parametrize(
+    "token_back_mode,token_back_schedule_mode",
+    [
+        ("epi_warps", "static"),
+        ("reuse_dispatch_warps", "static"),
+        ("reuse_dispatch_warps", "atomic_counter"),
+    ],
+)
+@pytest.mark.parametrize(
     "shape",
     [
         (4, 128, 128, 1, 1),
@@ -219,13 +227,21 @@ def _full_kernel_case(tokens, hidden, intermediate, experts, topk, *, knobs=None
     ],
 )
 def test_mxfp8_mxfp4_megamoe_full_kernel_boundary_shapes(
-    shape, load_balance_mode
+    shape, load_balance_mode, token_back_mode, token_back_schedule_mode
 ) -> None:
     _require_b200()
     workspace, launch, expected = _full_kernel_case(
-        *shape, knobs={"load_balance_mode": load_balance_mode}
+        *shape,
+        knobs={
+            "load_balance_mode": load_balance_mode,
+            "token_back_mode": token_back_mode,
+            "token_back_schedule_mode": token_back_schedule_mode,
+        },
     )
     try:
+        assert workspace.plan.config.token_back_by_dispatch == (
+            token_back_mode == "reuse_dispatch_warps"
+        )
         for _ in range(3):
             actual = launch()
             torch.cuda.synchronize()
@@ -237,6 +253,14 @@ def test_mxfp8_mxfp4_megamoe_full_kernel_boundary_shapes(
 @pytest.mark.arch_blackwell
 @pytest.mark.parametrize("load_balance_mode", ["static", "atomic_counter"])
 @pytest.mark.parametrize(
+    "token_back_mode,token_back_schedule_mode",
+    [
+        ("epi_warps", "static"),
+        ("reuse_dispatch_warps", "static"),
+        ("reuse_dispatch_warps", "atomic_counter"),
+    ],
+)
+@pytest.mark.parametrize(
     "tokens,tile_tokens,cluster_shape",
     [
         (33, 64, (1, 1, 1)),
@@ -246,7 +270,12 @@ def test_mxfp8_mxfp4_megamoe_full_kernel_boundary_shapes(
     ],
 )
 def test_mxfp8_mxfp4_megamoe_full_kernel_cuda_graph_replay(
-    load_balance_mode, tokens, tile_tokens, cluster_shape
+    load_balance_mode,
+    tokens,
+    tile_tokens,
+    cluster_shape,
+    token_back_mode,
+    token_back_schedule_mode,
 ) -> None:
     _require_b200()
     workspace, launch, expected = _full_kernel_case(
@@ -257,6 +286,8 @@ def test_mxfp8_mxfp4_megamoe_full_kernel_cuda_graph_replay(
         2,
         knobs={
             "load_balance_mode": load_balance_mode,
+            "token_back_mode": token_back_mode,
+            "token_back_schedule_mode": token_back_schedule_mode,
             "mma_tiler_mnk": (128, tile_tokens, 128),
             "cluster_shape_mnk": cluster_shape,
             "group_hint": 1,
@@ -280,3 +311,46 @@ def test_mxfp8_mxfp4_megamoe_full_kernel_cuda_graph_replay(
             torch.testing.assert_close(actual, expected, atol=0.015, rtol=0.05)
     finally:
         workspace.destroy()
+
+
+@pytest.mark.arch_blackwell
+def test_mxfp8_mxfp4_token_back_modes_are_bit_exact() -> None:
+    _require_b200()
+    baseline = None
+    for mode, schedule in (
+        ("epi_warps", "static"),
+        ("reuse_dispatch_warps", "static"),
+        ("reuse_dispatch_warps", "atomic_counter"),
+    ):
+        workspace, launch, expected = _full_kernel_case(
+            129,
+            384,
+            256,
+            4,
+            2,
+            knobs={
+                "token_back_mode": mode,
+                "token_back_schedule_mode": schedule,
+                "load_balance_mode": "atomic_counter",
+                "group_hint": 1,
+            },
+        )
+        try:
+            actual = launch().clone()
+            torch.cuda.synchronize()
+            torch.testing.assert_close(actual, expected, atol=0.015, rtol=0.05)
+            if baseline is None:
+                baseline = actual
+            else:
+                torch.testing.assert_close(actual, baseline, atol=0, rtol=0)
+            # Empty and restore routes without resetting the workspace. Stale
+            # pool rows must never leak into the deterministic home reduction.
+            ids = workspace.topk_idx.clone()
+            workspace.topk_idx.fill_(-1)
+            torch.testing.assert_close(
+                launch(), torch.zeros_like(actual), atol=0, rtol=0
+            )
+            workspace.topk_idx.copy_(ids)
+            torch.testing.assert_close(launch(), actual, atol=0, rtol=0)
+        finally:
+            workspace.destroy()

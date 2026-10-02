@@ -88,7 +88,10 @@ def validate_tactic(tactic: dict, *, partial: bool = True) -> None:
         "epi_warps",
         "reuse_dispatch_warps",
     ):
-        raise ValueError("unsupported token_back_mode")
+        raise ValueError(
+            "token_back_mode must be epi_warps or reuse_dispatch_warps; "
+            "standalone_warps is unsupported"
+        )
     if tactic.get("token_back_schedule_mode", "static") not in (
         "static",
         "atomic_counter",
@@ -114,6 +117,13 @@ def default_tactic(max_tokens_per_rank: int) -> Mxfp8Mxfp4Tactic:
     pipeline that fits shared memory for the actual geometry; pin an integer
     to override.  Offline tuning is expected to supersede the remaining fields
     through the knob cache.
+
+    ``token_back_mode="reuse_dispatch_warps"`` stages unweighted BF16 FC2
+    rows in a local pool and reuses dispatch warps to push them home. Both
+    modes use the same deterministic FP32, score-weighted top-k reduction.
+    ``token_back_schedule_mode`` selects static or atomic claims for the push
+    and has no effect with ``epi_warps``. Dedicated standalone warps are
+    unsupported, matching the BF16 x MXFP8 frontend.
     """
 
     if max_tokens_per_rank <= 0:

@@ -737,9 +737,10 @@ class PersistentMxfp8Mxfp4Epilogue:
 
         Publication happens after a four-warp CTA barrier and a device-scope
         fence.  The FC1 release-add unlocks FC2 mainloop work.  The optional
-        FC2 release-add is for future dispatch-warp token-back; the current
-        deterministic single-GPU reducer is launched after kernel completion
-        and therefore needs no in-kernel completion counter.
+        FC2 release-add unlocks dispatch-warp token-back after all feature
+        and token tiles for an expert have reached the local BF16 pool.
+        Direct epilogue token-back needs no completion counter: the reducer
+        runs after the collective kernel tail.
         """
 
         consumer_state = pipeline.make_pipeline_state(

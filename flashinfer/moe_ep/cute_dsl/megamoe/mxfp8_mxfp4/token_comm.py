@@ -117,9 +117,13 @@ def make_token_comm_binding(
     if config.token_back_by_dispatch:
         if fc2_n_tile is None or fc2_n_tile <= 0:
             raise ValueError("token-back requires a positive fc2_n_tile")
-        publishes = ((config.hidden + fc2_n_tile - 1) // fc2_n_tile) * cluster_shape_mn[
-            0
-        ]
+        # Each feature-cluster tile publishes once per CTA, including CTAs
+        # with no live rows in the last token-cluster tile.
+        publishes = (
+            ((config.hidden + fc2_n_tile - 1) // fc2_n_tile)
+            * cluster_shape_mn[0]
+            * cluster_shape_mn[1]
+        )
     else:
         publishes = 0
 
