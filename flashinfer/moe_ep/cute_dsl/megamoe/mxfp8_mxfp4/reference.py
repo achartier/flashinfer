@@ -227,27 +227,27 @@ def quantize_mxfp4(values: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return packed, raw_scale
 
 
-def interleave_gate_up_32(w13: torch.Tensor) -> torch.Tensor:
-    """Convert canonical ``gate || up`` rows to alternating 32-row blocks."""
+def interleave_gate_up_8(w13: torch.Tensor) -> torch.Tensor:
+    """Convert canonical ``gate || up`` rows to alternating 8-row blocks."""
 
-    if w13.ndim < 2 or w13.shape[-2] % (2 * BLOCK_SIZE):
-        raise ValueError("w13 output dimension must be divisible by 64")
+    if w13.ndim < 2 or w13.shape[-2] % (2 * 8):
+        raise ValueError("w13 output dimension must be divisible by 16")
     intermediate = w13.shape[-2] // 2
     gate, up = w13.split(intermediate, dim=-2)
     leading = gate.shape[:-2]
     hidden = gate.shape[-1]
-    gate = gate.reshape(*leading, intermediate // BLOCK_SIZE, BLOCK_SIZE, hidden)
-    up = up.reshape(*leading, intermediate // BLOCK_SIZE, BLOCK_SIZE, hidden)
+    gate = gate.reshape(*leading, intermediate // 8, 8, hidden)
+    up = up.reshape(*leading, intermediate // 8, 8, hidden)
     return torch.stack((gate, up), dim=-3).reshape(*leading, 2 * intermediate, hidden)
 
 
-def _swiglu_interleaved_32(
+def _swiglu_interleaved_8(
     fc1: torch.Tensor, gate_up_clamp: Optional[float]
 ) -> torch.Tensor:
     rows, two_i = fc1.shape
-    if two_i % (2 * BLOCK_SIZE):
-        raise ValueError("FC1 output dimension must be divisible by 64")
-    paired = fc1.reshape(rows, -1, 2, BLOCK_SIZE)
+    if two_i % (2 * 8):
+        raise ValueError("FC1 output dimension must be divisible by 16")
+    paired = fc1.reshape(rows, -1, 2, 8)
     gate = paired[:, :, 0, :]
     up = paired[:, :, 1, :]
     if gate_up_clamp is not None:
@@ -335,7 +335,7 @@ def compute_reference(
     * ``input_q``: ``(R, T, H)`` E4M3; ``input_scale``: ``(R,T,H/32)``.
     * ``topk_ids`` and ``topk_weights``: ``(R, T, Ktop)``.
     * ``w13_packed``: ``(E, 2I, H/2)`` packed E2M1.  Its output rows use
-      alternating 32-row gate/up blocks.  ``w13_scale`` is ``(E,2I,H/32)``.
+      alternating 8-row gate/up blocks.  ``w13_scale`` is ``(E,2I,H/32)``.
     * ``w2_packed``: ``(E, H, I/2)`` packed E2M1; ``w2_scale`` is
       ``(E,H,I/32)``.
 
@@ -369,7 +369,7 @@ def compute_reference(
         rank_idx, token_idx, slot_idx = routed.unbind(dim=1)
         gathered = input_fp32[rank_idx, token_idx]
         fc1 = gathered @ w13_fp32[expert].transpose(0, 1)
-        swiglu = _swiglu_interleaved_32(fc1, gate_up_clamp)
+        swiglu = _swiglu_interleaved_8(fc1, gate_up_clamp)
         fc1_q, fc1_scale = quantize_mxfp8(swiglu)
         fc1_roundtrip = dequantize_mxfp8(fc1_q, fc1_scale)
         fc2 = fc1_roundtrip @ w2_fp32[expert].transpose(0, 1)
@@ -400,7 +400,7 @@ __all__ = [
     "decode_e8m0",
     "dequantize_mxfp4",
     "dequantize_mxfp8",
-    "interleave_gate_up_32",
+    "interleave_gate_up_8",
     "quantize_mxfp4",
     "quantize_mxfp8",
 ]

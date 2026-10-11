@@ -1,6 +1,8 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+from typing import Any
+
 import pytest
 
 from flashinfer.moe_ep.cute_dsl.megamoe.mxfp8_mxfp4.token_comm import (
@@ -15,7 +17,7 @@ from flashinfer.moe_ep.cute_dsl.megamoe.mxfp8_mxfp4.workspace import (
 
 
 def _config(**kwargs) -> WorkspaceConfig:
-    values = dict(
+    values: dict[str, Any] = dict(
         world_size=2,
         num_topk=4,
         num_experts_per_rank=8,
@@ -50,8 +52,12 @@ def test_pool_and_scale_sideband_sizes_match_dispatch_geometry() -> None:
     assert scales.nbytes == (config.pool_sf_capacity * config.sf_uint32_per_token * 4)
 
 
-def test_counter_prefixes_end_at_first_data_region() -> None:
-    plan = make_workspace_plan(_config(load_balance_mode="atomic_counter"))
+@pytest.mark.parametrize("mode,count", [("atomic_counter", 1), ("alternating", 2)])
+def test_counter_prefixes_end_at_first_data_region(mode, count) -> None:
+    plan = make_workspace_plan(_config(load_balance_mode=mode))
+    counter = plan.local.region("load_balance_counter")
+    assert counter.spec.shape == (count,)
+    assert counter.end <= plan.local.zero_prefix_bytes
     assert plan.local.zero_prefix_bytes == plan.local.region("l1_token_buffer").offset
     assert (
         plan.shared.zero_prefix_bytes == plan.shared.region("src_token_topk_idx").offset

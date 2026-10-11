@@ -178,6 +178,8 @@ class DeviceSchedulerParams:
     the MX block-32 invariant.
     """
 
+    # load_balance_counter_ptr addresses one int32 for atomic_counter, or
+    # two consecutive int32s (FC1, FC2) for alternating. Reset before launch.
     DEFAULT_NUM_STAGES = 2
 
     def __init__(
@@ -198,14 +200,18 @@ class DeviceSchedulerParams:
         fc2_ready_threshold: int | Int32,
         expert_data_row_offsets: Optional[cute.Tensor] = None,
         expert_scale_row_offsets: Optional[cute.Tensor] = None,
-        load_balance_mode: Literal["static", "atomic_counter"] = "static",
+        load_balance_mode: Literal[
+            "static", "atomic_counter", "alternating"
+        ] = "static",
         load_balance_counter_ptr=None,
         num_stages: int = DEFAULT_NUM_STAGES,
     ):
-        if load_balance_mode not in ("static", "atomic_counter"):
-            raise ValueError("load_balance_mode must be static or atomic_counter")
-        if load_balance_mode == "atomic_counter" and load_balance_counter_ptr is None:
-            raise ValueError("atomic_counter mode requires load_balance_counter_ptr")
+        if load_balance_mode not in ("static", "atomic_counter", "alternating"):
+            raise ValueError(
+                "load_balance_mode must be static, atomic_counter, or alternating"
+            )
+        if load_balance_mode != "static" and load_balance_counter_ptr is None:
+            raise ValueError("dynamic claiming requires load_balance_counter_ptr")
         if cta_tile_tokens <= 0 or cta_tile_features <= 0:
             raise ValueError("CTA tile extents must be positive")
         if any(v <= 0 for v in cluster_shape_token_feature):
@@ -269,7 +275,7 @@ class DeviceSchedulerParams:
         ):
             if value is not None:
                 values.extend(extract_mlir_values(value))
-        if self.load_balance_mode == "atomic_counter":
+        if self.load_balance_mode != "static":
             values.extend(extract_mlir_values(self.load_balance_counter_ptr))
         return values
 
@@ -300,7 +306,7 @@ class DeviceSchedulerParams:
         result.expert_scale_row_offsets = take(self.expert_scale_row_offsets)
         result.load_balance_counter_ptr = (
             take(self.load_balance_counter_ptr)
-            if self.load_balance_mode == "atomic_counter"
+            if self.load_balance_mode != "static"
             else None
         )
         for name in (
@@ -320,7 +326,7 @@ class DeviceSchedulerParams:
 
 
 class _SchedulerState:
-    _FIELDS = (
+    _FIELDS: tuple[str, ...] = (
         "group_first_expert",
         "group_last_expert",
         "phase",
@@ -359,7 +365,20 @@ class _SchedulerState:
             new_from_mlir_values(getattr(self, name), [value])
             for name, value in zip(self._FIELDS, values, strict=True)
         ]
-        return _SchedulerState(*rebound)
+        return type(self)(*rebound)
+
+
+class _AlternatingState(_SchedulerState):
+    _FIELDS: tuple[str, ...] = (
+        "pending",
+        "total_fc1",
+        "total_fc2",
+        "fc1_exhausted",
+        "fc2_exhausted",
+    )
+
+
+ALTERNATING_DONE = (1 << 31) - 1
 
 
 class _AtomicClaimState:
@@ -487,7 +506,7 @@ class DeviceSchedulerConsumer:
 
 
 class PersistentDeviceScheduler:
-    """CuTe-DSL persistent scheduler with static and atomic cluster claims."""
+    """CuTe-DSL scheduler with static, atomic, and alternating cluster claims."""
 
     def __init__(
         self,
@@ -511,6 +530,12 @@ class PersistentDeviceScheduler:
         self.current_work = current_work
         self._state = state
         self._atomic_state = atomic_state
+        if params.load_balance_mode == "alternating":
+            self._fc2_state = _SchedulerState(
+                *(getattr(state, name) for name in state._FIELDS)
+            )
+            self._fc2_state.phase = Int32(DevicePhase.FC2)
+            self._alternating = _AlternatingState(*(Int32(0) for _ in range(5)))
         self._fc1_feature_blocks = fc1_feature_blocks
         self._fc2_feature_blocks = fc2_feature_blocks
         self._pipeline = sched_pipeline
@@ -542,7 +567,7 @@ class PersistentDeviceScheduler:
             cluster_mbar: cute.struct.MemRange[cutlass.Int64, 2]
             cluster_claim: cute.struct.Align[cute.struct.MemRange[cutlass.Int32, 1], 16]
 
-        if params.load_balance_mode == "atomic_counter":
+        if params.load_balance_mode != "static":
             return AtomicSchedulerStorage
         return StaticSchedulerStorage
 
@@ -626,7 +651,7 @@ class PersistentDeviceScheduler:
 
         atomic_state = None
         cluster_pipeline = None
-        if const_expr(params.load_balance_mode == "atomic_counter"):
+        if const_expr(params.load_balance_mode != "static"):
             # Initialize with the other pipelines, before the driver's
             # pipeline_init_arrive/wait publishes the mbarriers to peers.
             cluster_pipeline = pipeline.PipelineAsync.create(
@@ -708,6 +733,33 @@ class PersistentDeviceScheduler:
                 self._atomic_state = self._atomic_state
             else:
                 self._atomic_state = self._atomic_state
+        elif const_expr(self.params.load_balance_mode == "alternating"):
+            if warp_idx == sched_warp_id:
+                blocks = Int32(0)
+                for expert in cutlass.range(0, self.expert_count, 1, unroll=1):
+                    count = self.params.expert_token_sizes[expert]
+                    blocks += (
+                        count + self.params.cluster_tile_tokens - 1
+                    ) // self.params.cluster_tile_tokens
+                n1 = self._fc1_feature_blocks
+                n2 = self._fc2_feature_blocks
+                clusters = self.num_persistent_clusters
+                total_waves = (blocks * n1 + clusters - 1) // clusters
+                # Cover every block touched by the first FC2 wave.
+                first_blocks = cutlass.min(blocks, (clusters + n2 - 1) // n2)
+                cover = (first_blocks * n1 + clusters - 1) // clusters
+                # Keep FC1 ahead even when FC2 consumes token blocks faster.
+                ahead = (
+                    n1 + (blocks - 1) * cutlass.max(n1 - n2, Int32(0)) + clusters - 1
+                ) // clusters + 1
+                self._alternating.pending = cutlass.min(
+                    total_waves, cutlass.max(cover, ahead)
+                )
+                self._alternating.total_fc1 = blocks * n1
+                self._alternating.total_fc2 = blocks * n2
+                self._alternating = self._alternating
+            else:
+                self._alternating = self._alternating
         elif const_expr(self.params.load_balance_mode == "static"):
             if warp_idx == sched_warp_id:
                 # Round-4 wait accounting (debug knob, mega only): the params
@@ -776,7 +828,17 @@ class PersistentDeviceScheduler:
             )
             tidx, _, _ = cute.arch.thread_idx(loc=loc, ip=ip)
             lane = tidx % Int32(32)
-            if const_expr(self._first_claim_pending):
+            if const_expr(self.params.load_balance_mode == "alternating"):
+                claimed = Int32(ALTERNATING_DONE)
+                if lane == Int32(0):
+                    claimed = self._claim_alternating()
+                    self._alternating = self._alternating
+                else:
+                    self._alternating = self._alternating
+                claimed = cute.arch.shuffle_sync(
+                    claimed, offset=0, mask=0xFFFFFFFF, mask_and_clamp=31
+                )
+            elif const_expr(self._first_claim_pending):
                 claimed = atomic.cached
             else:
                 claimed = Int32(0)
@@ -798,7 +860,106 @@ class PersistentDeviceScheduler:
         cute.arch.fence_acq_rel_cta()
         self._cluster_pipeline.sync_object_empty.arrive(atomic.consumer.index, Int32(0))
         atomic.consumer.advance()
+        # The alternating claim loop rebinds self across MLIR regions. Keep
+        # the advanced broadcast pipeline state, rather than its old alias.
+        self._atomic_state = atomic
         return claimed
+
+    @dsl_user_op
+    @cute.jit
+    def _claim_alternating(self, *, loc=None, ip=None) -> Int32:
+        # Only the cluster leader lane enters this routine; other lanes park
+        # at the shuffle. FC2 waits for *claims*, never for completion here.
+        a = self._alternating
+        claimed = Int32(ALTERNATING_DONE)
+        searching = Int32(1)
+        while searching != Int32(0):
+            if a.fc1_exhausted != Int32(0) and a.fc2_exhausted != Int32(0):
+                searching = Int32(0)
+            elif a.pending > Int32(0) or a.fc2_exhausted != Int32(0):
+                index = cute.arch.atomic_add(
+                    self.params.load_balance_counter_ptr, Int32(1)
+                )
+                if index < a.total_fc1:
+                    a.pending = cutlass.max(a.pending - Int32(1), Int32(0))
+                    claimed = index
+                    searching = Int32(0)
+                else:
+                    a.fc1_exhausted = Int32(1)
+                    a.pending = Int32(0)
+            else:
+                index = cute.arch.atomic_add(
+                    self.params.load_balance_counter_ptr + Int32(1), Int32(1)
+                )
+                a.pending = Int32(1) - a.fc1_exhausted
+                if index < a.total_fc2:
+                    threshold = (
+                        index // self._fc2_feature_blocks + Int32(1)
+                    ) * self._fc1_feature_blocks
+                    stats_offset = self.params.wait_stats_offset
+                    if const_expr(stats_offset is not None):
+                        from .wait_stats import Slot, globaltimer_lo, stat_add
+                        from .wait_stats_config import SLOTS
+
+                        started = globaltimer_lo()
+                    observed = Int32(0)
+                    while observed < threshold:
+                        observed = cute.arch.load(
+                            self.params.load_balance_counter_ptr,
+                            Int32,
+                            sem="acquire",
+                            scope="gpu",
+                        )
+                    if const_expr(stats_offset is not None):
+                        bx, by, bz = cute.arch.block_idx()
+                        gx, gy, _ = cute.arch.grid_dim()
+                        stat_add(
+                            self.params.fc1_done_counter_ptr
+                            + Int32(stats_offset)
+                            + (bx + by * gx + bz * gx * gy) * Int32(SLOTS)
+                            + Int32(Slot.SCHED_LATE_CLAIM_NS),
+                            globaltimer_lo() - started,
+                        )
+                    claimed = -index - Int32(1)
+                    searching = Int32(0)
+                else:
+                    a.fc2_exhausted = Int32(1)
+            a = a
+        self._alternating = a
+        return claimed
+
+    @dsl_user_op
+    @cute.jit
+    def _decode_alternating(self, claimed, *, loc=None, ip=None):
+        record = DeviceWorkRecord(Int32(DONE_EXPERT), *(Int32(0) for _ in range(7)))
+        if claimed != Int32(ALTERNATING_DONE):
+            # Each phase has its own monotone cursor over the full expert list.
+            if claimed < Int32(0):
+                saved_fc1 = self._state
+                self._state = self._fc2_state
+                index = -claimed - Int32(1)
+                end = self._state.expert_tile_end
+                while index >= end:
+                    self._advance_expert()
+                    self._state = self._state
+                    end = self._state.expert_tile_end
+                record = self._decode_inside_expert(index)
+                self._fc2_state = self._state
+                self._state = saved_fc1
+            else:
+                end = self._state.expert_tile_end
+                while claimed >= end:
+                    self._advance_expert()
+                    self._state = self._state
+                    end = self._state.expert_tile_end
+                record = self._decode_inside_expert(claimed)
+                self._fc2_state = self._fc2_state
+            self._state = self._state
+            self._fc2_state = self._fc2_state
+        else:
+            self._state = self._state
+            self._fc2_state = self._fc2_state
+        self.current_work = self._peek_readiness(record)
 
     @dsl_user_op
     @cute.jit
@@ -1035,11 +1196,14 @@ class PersistentDeviceScheduler:
         ):
             pass
         else:
-            if const_expr(self.params.load_balance_mode == "atomic_counter"):
+            if const_expr(self.params.load_balance_mode != "static"):
                 claimed = self._claim_atomic(loc=loc, ip=ip)
             else:
                 claimed = self._claim_static(loc=loc, ip=ip)
-            self._decode_claim(claimed, loc=loc, ip=ip)
+            if const_expr(self.params.load_balance_mode == "alternating"):
+                self._decode_alternating(claimed, loc=loc, ip=ip)
+            else:
+                self._decode_claim(claimed, loc=loc, ip=ip)
         if const_expr(self._first_claim_pending):
             self._first_claim_pending = False
 
@@ -1055,8 +1219,11 @@ class PersistentDeviceScheduler:
             self._fc2_feature_blocks,
         ):
             values.extend(extract_mlir_values(value))
-        if self.params.load_balance_mode == "atomic_counter":
+        if self.params.load_balance_mode != "static":
             values.extend(extract_mlir_values(self._atomic_state))
+        if self.params.load_balance_mode == "alternating":
+            values.extend(extract_mlir_values(self._fc2_state))
+            values.extend(extract_mlir_values(self._alternating))
         values.extend(extract_mlir_values(self._producer_state))
         return values
 
@@ -1080,9 +1247,12 @@ class PersistentDeviceScheduler:
         result._fc2_feature_blocks = take(self._fc2_feature_blocks)
         result._atomic_state = (
             take(self._atomic_state)
-            if self.params.load_balance_mode == "atomic_counter"
+            if self.params.load_balance_mode != "static"
             else None
         )
+        if self.params.load_balance_mode == "alternating":
+            result._fc2_state = take(self._fc2_state)
+            result._alternating = take(self._alternating)
         result._producer_state = take(self._producer_state)
         assert idx == len(values)
         result._pipeline = self._pipeline
@@ -1094,6 +1264,7 @@ class PersistentDeviceScheduler:
 
 
 __all__ = [
+    "ALTERNATING_DONE",
     "DONE_EXPERT",
     "DevicePhase",
     "DeviceSchedulerConsumer",

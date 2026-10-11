@@ -8,7 +8,7 @@ Input scales are losslessly permuted by a byte-copy kernel before FC12.
 """
 
 from types import SimpleNamespace
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 
@@ -51,8 +51,8 @@ class LeanFc12Launcher(PersistentFc12KernelBase):
                 )
             ),
         )
-        self._compiled = None
-        self._repack = None
+        self._compiled: Any = None
+        self._repack: Any = None
         self._device = None
 
     def _initialize(self, inputs):
@@ -168,9 +168,10 @@ class LeanFc12Launcher(PersistentFc12KernelBase):
             intermediate=cfg.intermediate,
             num_experts=cfg.local_num_experts,
         )
+        cm, cn, _ = self.tactic["cluster_shape_mnk"]
         active = cutlass_utils.HardwareInfo(
             device_id=device.index
-        ).get_max_active_clusters(1)
+        ).get_max_active_clusters(cm * cn)
         self._compiled = cute.compile(
             self._make_launcher(compute_config, active), **self._runtime(inputs)
         )
@@ -220,6 +221,7 @@ class LeanFc12Launcher(PersistentFc12KernelBase):
             fc1_output=_to_cute(self._fc1, 16),
             fc1_output_sf=_to_cute(self._fc1_sf, 16),
             route_terms=_to_cute(inputs.output.unsqueeze(1), 16),
+            output=None,  # Mega-only all-warp top-k reduction target.
             local_zero_prefix=None,
             shared_zero_prefix=None,
             load_balance_counter=None,

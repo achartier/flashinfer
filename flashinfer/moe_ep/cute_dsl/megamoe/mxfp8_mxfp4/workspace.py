@@ -147,7 +147,7 @@ class WorkspaceConfig:
     token_padding_block: int
     sf_padding_block: int
     cluster_tile_tokens: int
-    load_balance_mode: Literal["static", "atomic_counter"] = "static"
+    load_balance_mode: Literal["static", "atomic_counter", "alternating"] = "static"
     token_back_by_dispatch: bool = False
     token_back_schedule_mode: Literal["static", "atomic_counter"] = "static"
 
@@ -180,7 +180,7 @@ class WorkspaceConfig:
             raise ValueError(
                 "cluster_tile_tokens must be a multiple of token_padding_block"
             )
-        if self.load_balance_mode not in ("static", "atomic_counter"):
+        if self.load_balance_mode not in ("static", "atomic_counter", "alternating"):
             raise ValueError("unsupported load_balance_mode")
         if self.token_back_schedule_mode not in ("static", "atomic_counter"):
             raise ValueError("unsupported token_back_schedule_mode")
@@ -253,8 +253,11 @@ def local_region_specs(config: WorkspaceConfig) -> tuple[RegionSpec, ...]:
         )
         if config.token_back_schedule_mode == "atomic_counter":
             specs.append(_region("token_back_schedule_counter", "int32", 4, (1,)))
-    if config.load_balance_mode == "atomic_counter":
-        specs.append(_region("load_balance_counter", "int32", 4, (1,)))
+    if config.load_balance_mode != "static":
+        # Alternating uses independent FC1/FC2 counters. Both live in the
+        # zero-prefix region reset by the kernel tail on every replay.
+        count = 2 if config.load_balance_mode == "alternating" else 1
+        specs.append(_region("load_balance_counter", "int32", 4, (count,)))
 
     sf_cols = round_up(config.intermediate // MXFP8_SF_VEC_SIZE, 4)
     sf_rows_upper = pool + config.num_experts_per_rank * config.sf_padding_block

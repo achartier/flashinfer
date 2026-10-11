@@ -12,6 +12,10 @@ lossless byte permutation to the kernel's atom-swizzled scale layout. It must
 not dequantize/requantize inputs. Its private FC1 scale plane has independent
 128-row padding. Only valid output rows are defined, in input data-row order.
 
+FC1 weights and their scales use gate8/up8 row interleaving before the
+K-major transpose. Canonical weight packs are converted by backend preprocessing;
+callers supplying this low-level ABI must prepare the same row permutation.
+
 Metadata stays on-device during launch/capture. ``build_lean_row_plan`` is a
 host fixture/planning utility, not a way to read GPU counts in a launch path.
 """

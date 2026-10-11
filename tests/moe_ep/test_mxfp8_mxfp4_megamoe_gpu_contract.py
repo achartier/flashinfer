@@ -142,14 +142,24 @@ def test_mxfp8_mxfp4_megamoe_frontend_requires_warmup_before_graph_capture() -> 
         frontend.run(missed)
 
 
-def _full_kernel_case(tokens, hidden, intermediate, experts, topk, *, knobs=None):
+def _full_kernel_case(
+    tokens,
+    hidden,
+    intermediate,
+    experts,
+    topk,
+    *,
+    knobs=None,
+    capacity_tactics=None,
+    check_reference=True,
+):
     from flashinfer.moe_ep.cute_dsl.megamoe.mxfp8_mxfp4.integration import (
         get_symm_buffer_for_mxfp8_mxfp4_mega_moe,
         mxfp8_mxfp4_mega_moe,
     )
     from flashinfer.moe_ep.cute_dsl.megamoe.mxfp8_mxfp4.reference import (
         compute_reference,
-        interleave_gate_up_32,
+        interleave_gate_up_8,
         quantize_mxfp4,
         quantize_mxfp8,
     )
@@ -162,11 +172,19 @@ def _full_kernel_case(tokens, hidden, intermediate, experts, topk, *, knobs=None
     def random(shape, scale):
         return torch.randn(shape, generator=generator, device="cuda") * scale
 
+    def quantize_weights(weights):
+        # The exhaustive FP4 oracle materializes 16 distances per value.
+        # Bound its temporary memory for customer-sized multi-expert weights.
+        if weights.numel() > 256 * 1024 * 1024:
+            quantized = [quantize_mxfp4(expert) for expert in weights]
+            return tuple(torch.stack(parts) for parts in zip(*quantized, strict=True))
+        return quantize_mxfp4(weights)
+
     xq, xs = quantize_mxfp8(random((tokens, hidden), 0.5))
-    w13q, w13s = quantize_mxfp4(
-        interleave_gate_up_32(random((experts, 2 * intermediate, hidden), 0.125))
+    w13q, w13s = quantize_weights(
+        interleave_gate_up_8(random((experts, 2 * intermediate, hidden), 0.125))
     )
-    w2q, w2s = quantize_mxfp4(random((experts, hidden, intermediate), 0.125))
+    w2q, w2s = quantize_weights(random((experts, hidden, intermediate), 0.125))
     ids = torch.arange(tokens * topk, device="cuda").reshape(tokens, topk) % experts
     # Empty experts, masked routes, nonuniform scores, and partial token tiles.
     if experts > topk:
@@ -174,16 +192,18 @@ def _full_kernel_case(tokens, hidden, intermediate, experts, topk, *, knobs=None
     if tokens:
         ids[-1, -1] = -1
     scores = random((tokens, topk), 0.3)
-    expected = compute_reference(
-        input_q=xq.unsqueeze(0),
-        input_scale=xs.unsqueeze(0),
-        topk_ids=ids.unsqueeze(0),
-        topk_weights=scores.unsqueeze(0),
-        w13_packed=w13q,
-        w13_scale=w13s,
-        w2_packed=w2q,
-        w2_scale=w2s,
-    ).output[0]
+    expected = None
+    if check_reference:
+        expected = compute_reference(
+            input_q=xq.unsqueeze(0),
+            input_scale=xs.unsqueeze(0),
+            topk_ids=ids.unsqueeze(0),
+            topk_weights=scores.unsqueeze(0),
+            w13_packed=w13q,
+            w13_scale=w13s,
+            w2_packed=w2q,
+            w2_scale=w2s,
+        ).output[0]
     workspace = get_symm_buffer_for_mxfp8_mxfp4_mega_moe(
         experts,
         max(tokens, 1),
@@ -193,6 +213,7 @@ def _full_kernel_case(tokens, hidden, intermediate, experts, topk, *, knobs=None
         0,
         1,
         knobs=knobs,
+        capacity_tactics=capacity_tactics,
     )
     workspace.x[:tokens].copy_(xq)
     workspace.x_sf[:tokens].view(torch.uint8).copy_(xs)
@@ -208,7 +229,9 @@ def _full_kernel_case(tokens, hidden, intermediate, experts, topk, *, knobs=None
 
 
 @pytest.mark.arch_blackwell
-@pytest.mark.parametrize("load_balance_mode", ["static", "atomic_counter"])
+@pytest.mark.parametrize(
+    "load_balance_mode", ["static", "atomic_counter", "alternating"]
+)
 @pytest.mark.parametrize(
     "token_back_mode,token_back_schedule_mode",
     [
@@ -251,7 +274,9 @@ def test_mxfp8_mxfp4_megamoe_full_kernel_boundary_shapes(
 
 
 @pytest.mark.arch_blackwell
-@pytest.mark.parametrize("load_balance_mode", ["static", "atomic_counter"])
+@pytest.mark.parametrize(
+    "load_balance_mode", ["static", "atomic_counter", "alternating"]
+)
 @pytest.mark.parametrize(
     "token_back_mode,token_back_schedule_mode",
     [
@@ -354,3 +379,384 @@ def test_mxfp8_mxfp4_token_back_modes_are_bit_exact() -> None:
             torch.testing.assert_close(launch(), actual, atol=0, rtol=0)
         finally:
             workspace.destroy()
+
+
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize("epilogue_warps", [4, 8])
+@pytest.mark.parametrize(
+    "load_balance_mode", ["static", "atomic_counter", "alternating"]
+)
+@pytest.mark.parametrize(
+    "token_back_mode,token_back_schedule_mode",
+    [
+        ("epi_warps", "static"),
+        ("reuse_dispatch_warps", "static"),
+        ("reuse_dispatch_warps", "atomic_counter"),
+    ],
+)
+@pytest.mark.parametrize(
+    "tokens,hidden,mma_m,tile_tokens",
+    [
+        (0, 128, 128, 64),
+        (33, 384, 128, 64),
+        (193, 256, 256, 192),
+        (4097, 256, 256, 128),
+    ],
+)
+def test_megamoe_in_kernel_reduce_is_bit_exact(
+    tokens,
+    hidden,
+    mma_m,
+    tile_tokens,
+    epilogue_warps,
+    load_balance_mode,
+    token_back_mode,
+    token_back_schedule_mode,
+) -> None:
+    _require_b200()
+    baseline = None
+    for in_kernel_reduce in (False, True):
+        workspace, launch, expected = _full_kernel_case(
+            tokens,
+            hidden,
+            256,
+            4,
+            2,
+            knobs={
+                "in_kernel_reduce": in_kernel_reduce,
+                "epilogue_warps": epilogue_warps,
+                "load_balance_mode": load_balance_mode,
+                "token_back_mode": token_back_mode,
+                "token_back_schedule_mode": token_back_schedule_mode,
+                "mma_tiler_mnk": (mma_m, tile_tokens, 128),
+                "group_hint": 1,
+            },
+        )
+        try:
+            actual = launch().clone()
+            torch.testing.assert_close(actual, expected, atol=0.015, rtol=0.05)
+            if baseline is None:
+                baseline = actual
+            else:
+                assert torch.equal(actual.view(torch.uint8), baseline.view(torch.uint8))
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                output = launch()
+            # Replays alternate live, masked, and restored routes without
+            # clearing route terms. Masked NaN scores must never contribute.
+            ids = workspace.topk_idx.clone()
+            scores = workspace.topk_weights.clone()
+            for live in (True, False, True, False, True):
+                if live:
+                    workspace.topk_idx.copy_(ids)
+                    workspace.topk_weights.copy_(scores)
+                else:
+                    workspace.topk_idx.fill_(-1)
+                    workspace.topk_weights.fill_(float("nan"))
+                graph.replay()
+                torch.cuda.synchronize()
+                expected_bits = baseline if live else torch.zeros_like(output)
+                assert torch.equal(
+                    output.view(torch.uint8), expected_bits.view(torch.uint8)
+                )
+            del graph
+        finally:
+            workspace.destroy()
+
+
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize("topk", [1, 8, 32])
+@pytest.mark.parametrize("epilogue_warps", [4, 8])
+def test_megamoe_in_kernel_reduce_topk_limits(topk, epilogue_warps) -> None:
+    _require_b200()
+    baseline = None
+    for enabled in (False, True):
+        workspace, launch, expected = _full_kernel_case(
+            33,
+            256,
+            256,
+            32,
+            topk,
+            knobs={
+                "in_kernel_reduce": enabled,
+                "epilogue_warps": epilogue_warps,
+                "token_back_mode": "reuse_dispatch_warps",
+                "token_back_schedule_mode": "atomic_counter",
+            },
+        )
+        try:
+            actual = launch().clone()
+            torch.testing.assert_close(actual, expected, atol=0.015, rtol=0.05)
+            if baseline is None:
+                baseline = actual
+            else:
+                assert torch.equal(actual.view(torch.uint8), baseline.view(torch.uint8))
+        finally:
+            workspace.destroy()
+
+
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize("tile_tokens", [64, 128, 192])
+@pytest.mark.parametrize("mma_m", [128, 256])
+@pytest.mark.parametrize("token_back_mode", ["epi_warps", "reuse_dispatch_warps"])
+def test_megamoe_eight_warp_epilogue_is_bit_exact(
+    monkeypatch, tile_tokens, mma_m, token_back_mode
+) -> None:
+    _require_b200()
+    baseline = None
+    for warps in (4, 8):
+        monkeypatch.setenv("FLASHINFER_MXFP8_MXFP4_EPILOGUE_WARPS", str(warps))
+        workspace, launch, expected = _full_kernel_case(
+            193,
+            256,
+            256,
+            4,
+            2,
+            knobs={
+                "mma_tiler_mnk": (mma_m, tile_tokens, 128),
+                "cluster_shape_mnk": (2 if mma_m == 256 else 1, 1, 1),
+                "token_back_mode": token_back_mode,
+                "load_balance_mode": "atomic_counter",
+                "group_hint": 1,
+            },
+        )
+        try:
+            actual = launch().clone()
+            torch.cuda.synchronize()
+            torch.testing.assert_close(actual, expected, atol=0.015, rtol=0.05)
+            if baseline is None:
+                baseline = actual
+            else:
+                assert torch.equal(actual, baseline)
+            for _ in range(3):
+                assert torch.equal(launch(), baseline)
+        finally:
+            workspace.destroy()
+
+
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize("feature_ctas", [1, 2])
+def test_alternating_device_decode_matches_host(feature_ctas):
+    """Replay fixed phase-local counter outcomes on both cluster CTAs."""
+    _require_b200()
+    import cutlass
+    import cutlass.cute as cute
+    import cutlass.utils as utils
+    from cutlass.cute.runtime import from_dlpack
+    from flashinfer.moe_ep.cute_dsl.megamoe.mxfp8_mxfp4.device_scheduler import (
+        ALTERNATING_DONE,
+        DeviceSchedulerParams,
+        PersistentDeviceScheduler,
+    )
+    from flashinfer.moe_ep.cute_dsl.megamoe.mxfp8_mxfp4.scheduler import (
+        PersistentFc1Fc2Scheduler,
+        SchedulerConfig,
+    )
+
+    config = SchedulerConfig(
+        expert_token_counts=(0, 65, 0, 17, 0),
+        gate_up_size=512,
+        hidden_size=256,
+        cta_tile_m=64,
+        cta_tile_n=128,
+        cluster_shape_mn=(1, feature_ctas),
+        group_hint=1,
+        token_padding_block=64,
+        sf_padding_block=128,
+        num_persistent_clusters=1,
+        fc2_ready_threshold=4,
+    )
+    model = PersistentFc1Fc2Scheduler(config)
+    # Monotone within each phase, with independent cursors across empty
+    # experts and distinct data/SF padding. Include gaps as atomic peers do.
+    claims = [
+        0,
+        1,
+        -1,
+        3,
+        -2,
+        3 * config.fc1_feature_blocks - 1,
+        -(3 * config.fc2_feature_blocks),
+        ALTERNATING_DONE,
+    ]
+    counts = torch.tensor(config.expert_token_counts, device="cuda", dtype=torch.int32)
+    indices = torch.tensor(claims, device="cuda", dtype=torch.int32)
+    counters = torch.zeros(32, device="cuda", dtype=torch.int32)
+    output = torch.empty(
+        (feature_ctas, len(claims), 8), device="cuda", dtype=torch.int32
+    )
+
+    @cute.kernel
+    def kernel(counts, indices, counters, output):
+        params = DeviceSchedulerParams(
+            expert_token_sizes=counts,
+            expert_count=5,
+            gate_up_size=512,
+            hidden_size=256,
+            cta_tile_tokens=64,
+            cta_tile_features=128,
+            cluster_shape_token_feature=(1, feature_ctas),
+            group_hint=1,
+            token_padding_block=64,
+            sf_padding_block=128,
+            fc1_ready_counter_ptr=counters.iterator,
+            fc1_done_counter_ptr=counters.iterator,
+            fc2_ready_threshold=4,
+            load_balance_mode="alternating",
+            load_balance_counter_ptr=counters.iterator,
+        )
+        storage = utils.SmemAllocator().allocate(
+            PersistentDeviceScheduler.make_storage_struct(params)
+        )
+        scheduler = PersistentDeviceScheduler.create(
+            params, cute.arch.block_idx(), cute.arch.grid_dim(), storage, 32
+        )
+        bx, _, _ = cute.arch.block_idx()
+        for i in cutlass.range(len(claims), unroll=1):
+            scheduler._decode_alternating(indices[i])
+            scheduler = scheduler
+            words = scheduler.current_work.to_rmem()
+            if cute.arch.lane_idx() == 0:
+                for j in cutlass.range_constexpr(8):
+                    output[bx, i, j] = words[j]
+
+    @cute.jit
+    def launch(counts, indices, counters, output):
+        kernel(counts, indices, counters, output).launch(
+            grid=(feature_ctas, 1, 1),
+            block=(32, 1, 1),
+            cluster=(feature_ctas, 1, 1),
+        )
+
+    args = [from_dlpack(t) for t in (counts, indices, counters, output)]
+    cute.compile(launch, *args)(*args)
+    torch.cuda.synchronize()
+    expected = [
+        [
+            model.record_for_alternating(c, cta_coord_mn=(0, f)).to_words()
+            for c in claims
+        ]
+        for f in range(feature_ctas)
+    ]
+    assert output.cpu().tolist() == [[list(w) for w in row] for row in expected]
+
+
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize(
+    "shape",
+    [
+        (193, 256, 4096, 4, 2),
+        (4097, 256, 256, 4, 2),
+        # Leave work after warm-up to exercise phase alternation on a
+        # full B200 grid.
+        (4, 4096, 6400, 32, 8),
+    ],
+)
+@pytest.mark.parametrize("epilogue_warps", [4, 8])
+def test_alternating_order_is_bit_exact_to_static(shape, epilogue_warps):
+    _require_b200()
+    baseline = None
+    for mode in ("static", "alternating"):
+        workspace, launch, expected = _full_kernel_case(
+            *shape,
+            knobs={
+                "load_balance_mode": mode,
+                "epilogue_warps": epilogue_warps,
+                "group_hint": 1,
+            },
+        )
+        try:
+            actual = launch().clone()
+            torch.testing.assert_close(actual, expected, atol=0.015, rtol=0.05)
+            if baseline is None:
+                baseline = actual
+            else:
+                assert torch.equal(actual.view(torch.uint8), baseline.view(torch.uint8))
+            for _ in range(3):
+                assert torch.equal(
+                    launch().view(torch.uint8), baseline.view(torch.uint8)
+                )
+        finally:
+            workspace.destroy()
+
+
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize("epilogue_warps", [4, 8])
+def test_alternating_claims_without_reference_gemm(epilogue_warps):
+    """Sanitizer target: compare all output bytes without instrumenting cuBLAS.
+
+    The 31 live expert blocks and 8/4 feature widths leave an alternating tail
+    after the warm-up on a full B200. Independent-reference coverage lives in
+    test_alternating_order_is_bit_exact_to_static.
+    """
+    _require_b200()
+    baseline = None
+    for mode in ("static", "alternating"):
+        workspace, launch, _ = _full_kernel_case(
+            129,
+            1024,
+            1024,
+            32,
+            8,
+            knobs={"load_balance_mode": mode, "epilogue_warps": epilogue_warps},
+            check_reference=False,
+        )
+        try:
+            actual = launch().clone()
+            assert torch.isfinite(actual).all()
+            if baseline is None:
+                baseline = actual
+            for _ in range(3):
+                assert torch.equal(
+                    launch().view(torch.uint8), baseline.view(torch.uint8)
+                )
+        finally:
+            workspace.destroy()
+
+
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize("load_balance_mode", ["atomic_counter", "alternating"])
+def test_megamoe_apply_knobs_switches_tactics_bit_exact(load_balance_mode) -> None:
+    """One workspace sized for two tactics switches A -> B -> A in place."""
+
+    _require_b200()
+    shape = (129, 256, 256, 4, 2)
+    tactics = [
+        {
+            "mma_tiler_mnk": (256, 64, 128),
+            "epilogue_warps": 4,
+            "in_kernel_reduce": False,
+            "group_hint": 1,
+        },
+        {
+            "mma_tiler_mnk": (256, 128, 128),
+            "epilogue_warps": 8,
+            "in_kernel_reduce": True,
+            "group_hint": 1,
+            "load_balance_mode": load_balance_mode,
+        },
+    ]
+    fresh = []
+    for knobs in tactics:
+        workspace, launch, expected = _full_kernel_case(*shape, knobs=knobs)
+        try:
+            fresh.append(launch().clone())
+            torch.testing.assert_close(fresh[-1], expected, atol=0.015, rtol=0.05)
+        finally:
+            workspace.destroy()
+    workspace, launch, _ = _full_kernel_case(
+        *shape, knobs=tactics[0], capacity_tactics=tactics
+    )
+    try:
+        assert all(workspace.fits(knobs) for knobs in tactics)
+        for index in (0, 1, 0, 1):
+            workspace.apply_knobs(tactics[index])
+            actual = launch()
+            assert torch.equal(actual.view(torch.uint8), fresh[index].view(torch.uint8))
+        # A tactic whose plan exceeds the allocation is rejected, not clipped.
+        too_big = {**tactics[0], "token_back_mode": "reuse_dispatch_warps"}
+        assert not workspace.fits(too_big)
+        with pytest.raises(ValueError, match="capacity_tactics"):
+            workspace.apply_knobs(too_big)
+    finally:
+        workspace.destroy()

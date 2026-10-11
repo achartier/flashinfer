@@ -3,21 +3,14 @@
 
 """Autonomous persistent epilogue for MXFP8 x MXFP4 MegaMoE.
 
-The native swap-AB MMA leaves an accumulator tile in TMEM with feature rows
-and token columns.  The numerical epilogues in :mod:`fc1_epilogue` and
-:mod:`fc2_epilogue` intentionally operate on one token-major K32 register
-block.  This module owns the missing device orchestration:
+The swap-AB MMA leaves feature rows and token columns in TMEM. FC1's
+16dp256b loads match the gate8/up8 weight interleave, so each lane computes
+SwiGLU directly without transposing or exchanging gate/up values. Only K32
+block maxima cross lanes and paired warps. FC2 retains the token-major
+register transpose for contiguous BF16 route stores.
 
-* wait for and release accumulator pipeline stages;
-* traverse FC1 gate/up and FC2 hidden TMEM tiles;
-* transpose each 32x32 tile from feature-major to token-major registers;
-* invoke the format-specific FC1 and FC2 primitives;
-* publish FC1 readiness only after data and scale stores are visible; and
-* resolve FC2 route metadata for identical local and peer route-slot stores.
-
-This is a correctness-first implementation.  It deliberately uses a regular
-two-stage, non-overlapping accumulator pipeline.  Register shuffles replace
-the older in-place TMEM transpose and keep the release boundary explicit.
+This module owns accumulator wait/release, tile traversal, output stores,
+and FC1 readiness publication after the output data and scales are visible.
 
 Routing scores are absent by construction.  FC2 publishes an unweighted BF16
 term for every ``(source token, source top-k slot)``; the deterministic reducer
@@ -29,7 +22,7 @@ from __future__ import annotations
 import os
 import sys
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 
 import cutlass
 import cutlass.cute as cute
@@ -40,22 +33,30 @@ from cutlass.cute.nvgpu import tcgen05
 from cutlass.cutlass_dsl import Int32, Int64, dsl_user_op
 
 from .device_scheduler import DevicePhase
-from .fc1_epilogue import Fc1Epilogue, Fc1EpilogueConfig, SF_VEC_SIZE
+from .fc1_epilogue import (
+    Fc1Epilogue,
+    Fc1EpilogueConfig,
+    SF_VEC_SIZE,
+    _clamp_and_swiglu,
+    _quantize_with_amax,
+)
+from .fc1_store import fc1_tma_store_enabled, issue_fc1_store, store_native_e4m3
 from .wait_stats import Slot, globaltimer_lo, stat_add, stats_slot_ptr
+from .iket_markers import iket_enabled, iket_fine_ctas, is_fine_cta, load_iket
 from .fc2_epilogue import FC2_EPILOGUE_TILE, Fc2Bf16Epilogue, Fc2RouteStore
 
 
 WARP_SIZE = 32
 EPILOGUE_WARPS = 4
+EPILOGUE_WARPS_ENV = "FLASHINFER_MXFP8_MXFP4_EPILOGUE_WARPS"
+# IDs 0/1/2 are CTA/tile/TMEM barriers; dispatch owns 8/9/10.
+EXCHANGE_BARRIER_IDS = (3, 4)
 TOKEN_METADATA_BYTES = 8
 TMEM_ROW_STRIDE = 1 << 16
-# Gate/up exchange tile: [warp pair][lane][token] FP32. Every lane writes the
-# same token index per step, so a 32-word lane stride puts all 32 lanes in one
-# shared-memory bank; one pad word per lane row makes the access conflict-free.
-EXCHANGE_LANE_STRIDE = WARP_SIZE + 1
-# Rows 0-31 carry lane rows; rows 32/33 carry the two half-block amax values
-# of the split FC1 epilogue.
-EXCHANGE_ROWS = WARP_SIZE + 2
+# Only the two warps' half-block maxima cross shared memory. Each row
+# contains one amax per token; the final barrier protects reuse by the next group.
+EXCHANGE_LANE_STRIDE = WARP_SIZE
+EXCHANGE_ROWS = 2
 EXCHANGE_WORDS = (EPILOGUE_WARPS // 2) * EXCHANGE_ROWS * EXCHANGE_LANE_STRIDE
 
 # Skip 32-token epilogue groups whose first token lies beyond the tile's valid
@@ -64,12 +65,18 @@ EXCHANGE_WORDS = (EPILOGUE_WARPS // 2) * EXCHANGE_ROWS * EXCHANGE_LANE_STRIDE
 # Values: "fc1" (default), "none" (process every
 # group, the original behavior), "fc2", or "both".
 E1_SKIP_ENV = "FLASHINFER_MXFP8_MXFP4_E1_SKIP"
-# The FC1 epilogue splits each 32-token group's SwiGLU/quantization across
-# both warps of a gate/up pair by feature halves (round 4: about 6-11% faster
-# at 64+ tokens/expert, neutral below). "1" restores the original path, where
-# the gate warp transposes both matrices and does all the math.
+# Debug comparison path: use the register transpose with the same gate8/up8
+# weights. The default reads gate/up directly into each lane's registers.
 FC1_EPI_LEGACY_ENV = "FLASHINFER_MXFP8_MXFP4_FC1_EPI_LEGACY"
 _E1_SKIP_CHOICES = ("none", "fc1", "fc2", "both")
+
+
+def epilogue_warps_from_env() -> int:
+    """Read the experimental width once when constructing a launcher."""
+    value = os.environ.get(EPILOGUE_WARPS_ENV, "4").strip()
+    if value not in ("4", "8"):
+        raise ValueError(f"{EPILOGUE_WARPS_ENV} must be 4 or 8, got {value!r}")
+    return int(value)
 
 
 def _e1_skip_mode() -> str:
@@ -87,9 +94,9 @@ class DeviceEpilogueConfig:
 
     ``cta_tile_features`` is the swap-AB MMA M extent (weight/output rows),
     while ``cta_tile_tokens`` is its N extent.  FC1 rows are interleaved as
-    K32 gate followed by K32 up, so a 128-row feature tile produces 64
-    post-SwiGLU values.  FC2 uses all four epilogue warps and produces 128
-    hidden values per tile.
+    eight gate rows followed by eight up rows, so a 128-row feature tile produces 64
+    post-SwiGLU values. Each warpgroup covers all feature rows; with eight
+    epilogue warps, the two warpgroups process alternating token groups.
     """
 
     cta_tile_features: int = 128
@@ -100,8 +107,8 @@ class DeviceEpilogueConfig:
     gate_up_clamp: Optional[float] = None
     fast_math: bool = True
     # E1 switches, defaulted from E1_SKIP_ENV.  A skipped group's first token is at or beyond
-    # ``valid_tokens_in_cta_tile``, which is uniform across the epilogue warps,
-    # so all four warps skip together and the FC1 barriers stay balanced.
+    # ``valid_tokens_in_cta_tile``, which is uniform across each warpgroup,
+    # so its four warps skip together and the FC1 barriers stay balanced.
     skip_empty_fc1_groups: bool = field(
         default_factory=lambda: _e1_skip_mode() in ("fc1", "both")
     )
@@ -115,19 +122,21 @@ class DeviceEpilogueConfig:
                 "the correctness epilogue currently requires a 128-row "
                 "swap-AB feature tile"
             )
-        if self.cta_tile_tokens not in (2 * WARP_SIZE, EPILOGUE_WARPS * WARP_SIZE):
-            # Every warp covers each 32-token group of its feature rows; N64
-            # and N128 are the token tiles validated end to end.
-            raise ValueError("the four-warp epilogue requires N64 or N128")
+        if self.cta_tile_tokens not in (2 * WARP_SIZE, 4 * WARP_SIZE, 6 * WARP_SIZE):
+            # Every warp covers each 32-token group of its feature rows; N64,
+            # N128, and N192 are the token tiles validated end to end.
+            raise ValueError("the epilogue requires N64, N128, or N192")
         if self.accumulator_stages != 2:
             raise ValueError(
                 "the correctness epilogue uses exactly two non-overlapping "
                 "accumulator stages"
             )
-        if self.epilogue_warps != EPILOGUE_WARPS:
-            raise ValueError("the epilogue requires exactly four warps")
+        if self.epilogue_warps not in (4, 8):
+            raise ValueError("the epilogue requires four or eight warps")
         if self.barrier_id < 0:
             raise ValueError("barrier_id must be non-negative")
+        if self.epilogue_warps == 8 and self.barrier_id in EXCHANGE_BARRIER_IDS:
+            raise ValueError("tile and exchange barriers must differ")
         if self.gate_up_clamp is not None and self.gate_up_clamp < 0.0:
             raise ValueError("gate_up_clamp must be None or non-negative")
 
@@ -145,7 +154,7 @@ class DeviceEpilogueConfig:
 
     @property
     def fc2_active_warps(self) -> int:
-        return self.cta_tile_features // FC2_EPILOGUE_TILE
+        return self.epilogue_warps
 
     @property
     def accumulator_tmem_columns(self) -> int:
@@ -163,6 +172,36 @@ def route_metadata_host(packed: int) -> tuple[int, int, int]:
     value = packed & ((1 << 64) - 1)
     high = value >> 32
     return ((high >> 16) & 0xFFFF, value & 0xFFFFFFFF, high & 0xFFFF)
+
+
+@dsl_user_op
+def _store_predicated_u8(
+    ptr,
+    value,
+    valid,
+    offset: cutlass.Constexpr[int] = 0,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> None:
+    """Keep the byte offset immediate and predicate only the global store."""
+
+    llvm.inline_asm(
+        None,
+        [
+            ptr.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip),
+            cutlass.Uint32(value).ir_value(loc=loc, ip=ip),
+            Int32(valid).ir_value(loc=loc, ip=ip),
+        ],
+        "{ .reg .pred p; setp.ne.b32 p, $2, 0; "
+        f"@p st.global.u8 [$0 + {offset}], $1; }}",
+        "l,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
 
 
 @dsl_user_op
@@ -225,10 +264,22 @@ class PersistentMxfp8Mxfp4Epilogue:
         if config is None:
             config = DeviceEpilogueConfig()
         self.config = config
-        self.fc1_split = os.environ.get(FC1_EPI_LEGACY_ENV, "0").strip() != "1"
+        if EPILOGUE_WARPS_ENV in os.environ:
+            print(
+                f"[mxfp8_mxfp4 epilogue] epilogue_warps={config.epilogue_warps}",
+                file=sys.stderr,
+                flush=True,
+            )
+        self.fc1_tma_store = fc1_tma_store_enabled()
+        self.fc1_native = os.environ.get(FC1_EPI_LEGACY_ENV, "0").strip() != "1"
+        # IKET ranges (CUTE_DSL_COMPILER_OPT=iket only; see iket_markers).
+        self.iket = iket_enabled()
+        self._iket: Any = load_iket() if self.iket else None
+        # Per-step FC1 tile ranges on the first CTAs only (see iket_markers).
+        self.iket_fine_ctas = iket_fine_ctas()
         if FC1_EPI_LEGACY_ENV in os.environ:
             print(
-                f"[mxfp8_mxfp4 epilogue] fc1_split={self.fc1_split}",
+                f"[mxfp8_mxfp4 epilogue] fc1_native={self.fc1_native}",
                 file=sys.stderr,
                 flush=True,
             )
@@ -281,8 +332,11 @@ class PersistentMxfp8Mxfp4Epilogue:
         """Load the M32 group natively owned by one epilogue warp."""
 
         registers = cute.make_rmem_tensor(self._rmem_layout().shape, cutlass.Float32)
+        feature_warp_idx = warp_idx
+        if cutlass.const_expr(self.config.epilogue_warps == 8):
+            feature_warp_idx = warp_idx % Int32(4)
         offset = (
-            warp_idx * Int32(WARP_SIZE * TMEM_ROW_STRIDE)
+            feature_warp_idx * Int32(WARP_SIZE * TMEM_ROW_STRIDE)
             + token_group * Int32(WARP_SIZE)
             + acc_stage * Int32(self.config.cta_tile_tokens)
         )
@@ -321,53 +375,42 @@ class PersistentMxfp8Mxfp4Epilogue:
         return current
 
     @cute.jit
-    def _store_fc1_block(
+    def _load_fc1_native_half(
         self,
-        quantized: cute.Tensor,
-        raw_scale,
-        output_data: cute.Tensor,
-        output_scales: cute.Tensor,
-        data_token,
-        scale_token,
-        intermediate_block,
-    ) -> None:
-        """Store one E4M3 K32 block and its raw E8M0 scale byte."""
+        tmem_acc_tensor,
+        warp_idx,
+        token_group,
+        acc_stage,
+        half: cutlass.Constexpr[int],
+    ):
+        """Load 16 feature rows x 32 tokens without a register transpose.
 
-        destination_row = cute.slice_(output_data, (data_token, None))
-        # Every row is 128-byte aligned and the block offset is K32, so this
-        # vector destination is at least 32-byte aligned.  Preserve that fact
-        # explicitly: slicing a dynamic row otherwise degrades the iterator's
-        # inferred alignment to one byte and fails the 256-bit store verifier.
-        destination = cute.make_tensor(
-            cute.make_ptr(
-                cutlass.Float8E4M3FN,
-                destination_row.iterator.toint()
-                + Int64(intermediate_block) * Int64(SF_VEC_SIZE),
-                cute.AddressSpace.gmem,
-                assumed_align=32,
-            ),
-            cute.make_layout(SF_VEC_SIZE),
+        For register r and lane l, 16dp256b maps to row l//4 + 8*((r//2)%2)
+        and column 2*(l%4) + r%2 + 8*(r//4). Gate8/up8 interleaving puts
+        matching gate/up in registers (4*t,4*t+1)/(4*t+2,4*t+3).
+        """
+        offset = (
+            (warp_idx % Int32(4)) * Int32(32 * TMEM_ROW_STRIDE)
+            + Int32(half * 16 * TMEM_ROW_STRIDE)
+            + token_group * Int32(32)
+            + acc_stage * Int32(self.config.cta_tile_tokens)
+        )
+        source = cute.make_tensor(
+            tmem_acc_tensor.iterator + cute.assume(offset, divby=32),
+            cute.make_layout((((16, 32), 1),), stride=(((TMEM_ROW_STRIDE, 1), 0),)),
+        )
+        registers = cute.make_rmem_tensor(
+            cute.make_layout((((16,), 1),), stride=(((1,), 0),)).shape,
+            cutlass.Float32,
         )
         cute.copy(
             cute.make_copy_atom(
-                cute.nvgpu.CopyUniversalOp(),
-                cutlass.Float8E4M3FN,
-                num_bits_per_copy=256,
+                tcgen05.Ld16x256bOp(tcgen05.Repetition.x4), cutlass.Float32
             ),
-            cute.coalesce(quantized),
-            destination,
+            source,
+            registers,
         )
-        scale_cell = cute.local_tile(
-            output_scales,
-            (1, 1, 1),
-            (
-                scale_token,
-                intermediate_block * Int32(SF_VEC_SIZE),
-                Int32(0),
-            ),
-        )
-        scale_bytes = cute.recast_tensor(scale_cell, cutlass.Uint8)
-        scale_bytes[0] = raw_scale.to(cutlass.Uint8)
+        return registers
 
     @cute.jit
     def _run_fc1_task_tile(
@@ -379,20 +422,41 @@ class PersistentMxfp8Mxfp4Epilogue:
         fc1_output: cute.Tensor,
         fc1_output_scales: cute.Tensor,
         epilogue_exchange: cute.Tensor,
+        fc1_store,
         boundary,
         warp_idx,
         lane_idx,
+        warpgroup_idx,
+        fine_cta,
     ) -> None:
         """Traverse gate/up TMEM and publish E4M3+E8M0/K32 handoff rows."""
 
         # Swap-AB TMEM rows are interleaved gate/up features and columns are
-        # tokens.  Each epilogue warp owns one K32 token-column group, and LDTM
-        # directly gives each lane one token's contiguous K32 feature block.
+        # tokens. Each warp owns 32 feature rows. Warpgroup-local TMEM rows
+        # repeat in the second warpgroup, but exchange pairs must be disjoint.
         pair_idx = warp_idx // Int32(2)
-        is_gate_warp = (warp_idx & Int32(1)) == Int32(0)
         for token_group in cutlass.range_constexpr(self.config.token_groups):
-            if cutlass.const_expr(self.config.skip_empty_fc1_groups):
-                if Int32(token_group * WARP_SIZE) < work.valid_tokens_in_cta_tile:
+            if cutlass.const_expr(self.config.epilogue_warps == 4) or (
+                Int32(token_group % 2) == warpgroup_idx
+            ):
+                if cutlass.const_expr(self.config.skip_empty_fc1_groups):
+                    if Int32(token_group * WARP_SIZE) < work.valid_tokens_in_cta_tile:
+                        self._run_fc1_token_group(
+                            work=work,
+                            token_group=token_group,
+                            tmem_acc_tensor=tmem_acc_tensor,
+                            acc_stage=acc_stage,
+                            fc1_output=fc1_output,
+                            fc1_output_scales=fc1_output_scales,
+                            epilogue_exchange=epilogue_exchange,
+                            fc1_store=fc1_store,
+                            boundary=boundary,
+                            warp_idx=warp_idx,
+                            lane_idx=lane_idx,
+                            pair_idx=pair_idx,
+                            fine_cta=fine_cta,
+                        )
+                else:
                     self._run_fc1_token_group(
                         work=work,
                         token_group=token_group,
@@ -401,27 +465,13 @@ class PersistentMxfp8Mxfp4Epilogue:
                         fc1_output=fc1_output,
                         fc1_output_scales=fc1_output_scales,
                         epilogue_exchange=epilogue_exchange,
+                        fc1_store=fc1_store,
                         boundary=boundary,
                         warp_idx=warp_idx,
                         lane_idx=lane_idx,
                         pair_idx=pair_idx,
-                        is_gate_warp=is_gate_warp,
+                        fine_cta=fine_cta,
                     )
-            else:
-                self._run_fc1_token_group(
-                    work=work,
-                    token_group=token_group,
-                    tmem_acc_tensor=tmem_acc_tensor,
-                    acc_stage=acc_stage,
-                    fc1_output=fc1_output,
-                    fc1_output_scales=fc1_output_scales,
-                    epilogue_exchange=epilogue_exchange,
-                    boundary=boundary,
-                    warp_idx=warp_idx,
-                    lane_idx=lane_idx,
-                    pair_idx=pair_idx,
-                    is_gate_warp=is_gate_warp,
-                )
 
     @cute.jit
     def _run_fc1_token_group(
@@ -434,151 +484,236 @@ class PersistentMxfp8Mxfp4Epilogue:
         fc1_output: cute.Tensor,
         fc1_output_scales: cute.Tensor,
         epilogue_exchange: cute.Tensor,
+        fc1_store,
         boundary,
         warp_idx,
         lane_idx,
         pair_idx,
-        is_gate_warp,
+        fine_cta,
     ) -> None:
-        """One 32-token FC1 group: load, gate/up exchange, SwiGLU, store."""
+        """One 32-token FC1 group: native load, SwiGLU, amax exchange, store."""
 
-        native = self._load_native_feature_group(
-            tmem_acc_tensor, warp_idx, Int32(token_group), acc_stage
-        )
-        if cutlass.const_expr(self.fc1_split):
-            self._run_fc1_token_group_split(
-                work=work,
-                token_group=token_group,
-                native=native,
-                fc1_output=fc1_output,
-                fc1_output_scales=fc1_output_scales,
-                epilogue_exchange=epilogue_exchange,
-                boundary=boundary,
-                warp_idx=warp_idx,
-                lane_idx=lane_idx,
-                pair_idx=pair_idx,
-                is_gate_warp=is_gate_warp,
+        if cutlass.const_expr(self.fc1_tma_store):
+            store_stage = (token_group // (self.config.epilogue_warps // 4)) % 2
+            full_group = Int32((token_group + 1) * 32) <= work.valid_tokens_in_cta_tile
+            stage = fc1_store[2][None, None, store_stage, warp_idx // Int32(4)]
+            staged_bytes = cute.make_rmem_tensor((16,), cutlass.Uint8)
+            if cutlass.const_expr(token_group >= 2 * (self.config.epilogue_warps // 4)):
+                if full_group:
+                    if warp_idx % Int32(4) == Int32(0):
+                        with cute.arch.elect_one():
+                            cute.arch.cp_async_bulk_wait_group(1, read=True)
+                    boundary.arrive_and_wait()
+
+        if cutlass.const_expr(self.fc1_native):
+            if cutlass.const_expr(self.iket_fine_ctas > 0):
+                if fine_cta:
+                    self._iket.range_push("fc1_ld_math")
+            first = self._load_fc1_native_half(
+                tmem_acc_tensor, warp_idx, Int32(token_group), acc_stage, 0
             )
-        else:
-            if not is_gate_warp:
-                for token in cutlass.range_constexpr(WARP_SIZE):
-                    epilogue_exchange[pair_idx, lane_idx, token] = native[token]
-            boundary.arrive_and_wait()
-            if is_gate_warp:
-                up_raw = cute.make_rmem_tensor(
-                    self._rmem_layout().shape, cutlass.Float32
+            second = self._load_fc1_native_half(
+                tmem_acc_tensor, warp_idx, Int32(token_group), acc_stage, 1
+            )
+            gate = cute.make_rmem_tensor((16,), cutlass.Float32)
+            up = cute.make_rmem_tensor((16,), cutlass.Float32)
+            for token in cutlass.range_constexpr(8):
+                register = (token // 2) * 4 + token % 2
+                gate[token * 2] = first[register]
+                up[token * 2] = first[register + 2]
+                gate[token * 2 + 1] = second[register]
+                up[token * 2 + 1] = second[register + 2]
+            values = cute.make_rmem_tensor((16,), cutlass.Float32)
+            _clamp_and_swiglu(
+                values, gate, up, self.fc1._clamp, self.config.fast_math, 16
+            )
+            maxima = cute.make_rmem_tensor((8,), cutlass.Float32)
+            for token in cutlass.range_constexpr(8):
+                v0, v1 = values[token * 2], values[token * 2 + 1]
+                # Match _block_amax's zero seed, including all-NaN fragments.
+                amax = cute.arch.fmax(
+                    cutlass.Float32(0.0),
+                    cute.arch.fmax(cute.arch.fmax(v0, -v0), cute.arch.fmax(v1, -v1)),
                 )
-                for token in cutlass.range_constexpr(WARP_SIZE):
-                    up_raw[token] = epilogue_exchange[pair_idx, lane_idx, token]
-                gate_token_major = self._transpose_to_token_major(native, lane_idx)
-                up_token_major = self._transpose_to_token_major(up_raw, lane_idx)
-                quantized, raw_scale = self.fc1.transform(
-                    gate_token_major, up_token_major
+                # Eight lanes, spaced four apart, cover 16 features for
+                # this token. The partner warp covers the other 16.
+                for shift in cutlass.range_constexpr(3):
+                    amax = cute.arch.fmax(
+                        amax, cute.arch.shuffle_sync_bfly(amax, offset=4 << shift)
+                    )
+                maxima[token] = amax
+                token_in_group = (lane_idx % Int32(4)) * Int32(2) + Int32(
+                    (token // 2) * 8 + token % 2
                 )
-                token_offset = Int32(token_group * WARP_SIZE) + lane_idx
-                if token_offset < work.valid_tokens_in_cta_tile:
-                    data_token = (
-                        work.cumulative_data_physical_row
-                        + work.tile_n_idx * Int32(self.config.cta_tile_tokens)
-                        + token_offset
+                if lane_idx < Int32(4):
+                    epilogue_exchange[pair_idx, warp_idx % Int32(2), token_in_group] = (
+                        amax
                     )
-                    scale_token = (
-                        work.cumulative_sf_physical_row
-                        + work.tile_n_idx * Int32(self.config.cta_tile_tokens)
-                        + token_offset
-                    )
-                    intermediate_block = work.tile_m_idx * Int32(2) + pair_idx
-                    self._store_fc1_block(
-                        quantized,
-                        raw_scale,
-                        fc1_output,
-                        fc1_output_scales,
-                        data_token,
-                        scale_token,
-                        intermediate_block,
-                    )
+            if cutlass.const_expr(self.iket_fine_ctas > 0):
+                if fine_cta:
+                    self._iket.range_pop()
+                    self._iket.range_push("fc1_amax_bar")
             boundary.arrive_and_wait()
-
-    @cute.jit
-    def _run_fc1_token_group_split(
-        self,
-        *,
-        work,
-        token_group: cutlass.Constexpr[int],
-        native: cute.Tensor,
-        fc1_output: cute.Tensor,
-        fc1_output_scales: cute.Tensor,
-        epilogue_exchange: cute.Tensor,
-        boundary,
-        warp_idx,
-        lane_idx,
-        pair_idx,
-        is_gate_warp,
-    ) -> None:
-        """Each warp of a pair computes one feature half of every token.
-
-        After each warp transposes its own matrix (lane = token), the gate
-        warp hands up features 16-31 of gate and the up warp features 0-15 of
-        up through one 33-word padded buffer (disjoint halves). The gate warp
-        then owns features 0-15 and the up warp features 16-31; the two
-        half-block amax values meet in rows 32/33 so both halves share the
-        block's E8M0 scale.
-        """
-
-        half = SF_VEC_SIZE // 2
-        token_major = self._transpose_to_token_major(native, lane_idx)
-        if is_gate_warp:
-            for feature in cutlass.range_constexpr(half):
-                epilogue_exchange[pair_idx, lane_idx, half + feature] = token_major[
-                    half + feature
-                ]
+            if cutlass.const_expr(self.iket_fine_ctas > 0):
+                if fine_cta:
+                    self._iket.range_pop()
+                    self._iket.range_push("fc1_quant_store")
+            # One address per lane and group. The native fragment owns rows
+            # {0, 1, 8, 9, 16, 17, 24, 25} and features {0, 8}. The launcher
+            # supplies a static row stride, so all remaining offsets are
+            # store immediates rather than repeated 64-bit row multiplies.
+            lane_row = (lane_idx % Int32(4)) * Int32(2)
+            tile_row = work.tile_n_idx * Int32(self.config.cta_tile_tokens)
+            group_row = tile_row + Int32(token_group * 32)
+            block = work.tile_m_idx * Int32(2) + pair_idx % Int32(2)
+            feature = (
+                block * Int32(32)
+                + (warp_idx % Int32(2)) * Int32(16)
+                + lane_idx // Int32(4)
+            )
+            data_row = work.cumulative_data_physical_row + group_row + lane_row
+            data_ptr = fc1_output.iterator + (
+                Int64(data_row) * Int64(fc1_output.stride[0]) + Int64(feature)
+            )
+            scales = cute.make_rmem_tensor((8,), cutlass.Uint8)
+            for token in cutlass.range_constexpr(8):
+                token_in_group = (lane_idx % Int32(4)) * Int32(2) + Int32(
+                    (token // 2) * 8 + token % 2
+                )
+                amax = cute.arch.fmax(
+                    maxima[token],
+                    epilogue_exchange[
+                        pair_idx, Int32(1) - warp_idx % Int32(2), token_in_group
+                    ],
+                )
+                pair_values = cute.make_rmem_tensor((2,), cutlass.Float32)
+                pair_values[0], pair_values[1] = (
+                    values[token * 2],
+                    values[token * 2 + 1],
+                )
+                quantized = cute.make_rmem_tensor((2,), cutlass.Float8E4M3FN)
+                raw_scale = _quantize_with_amax(pair_values, quantized, amax, 2)
+                scales[token] = raw_scale.to(cutlass.Uint8)
+                token_offset = Int32(token_group * 32) + token_in_group
+                valid = token_offset < work.valid_tokens_in_cta_tile
+                raw = cute.recast_tensor(quantized, cutlass.Uint8)
+                if cutlass.const_expr(self.fc1_tma_store):
+                    staged_bytes[(token // 2) * 4 + token % 2] = raw[0]
+                    staged_bytes[(token // 2) * 4 + token % 2 + 2] = raw[1]
+                    # A full TMA box would clobber the next expert's rows.
+                    valid = valid and not full_group
+                # Use one predicated path for full and partial groups to avoid
+                # duplicating the unrolled quantization and its register state.
+                row_offset = (token // 2) * 8 + token % 2
+                _store_predicated_u8(
+                    data_ptr, raw[0], valid, row_offset * fc1_output.stride[0]
+                )
+                _store_predicated_u8(
+                    data_ptr, raw[1], valid, row_offset * fc1_output.stride[0] + 8
+                )
+            if lane_idx < Int32(4) and warp_idx % Int32(2) == Int32(0):
+                # Expert SF rows are padded to 128, and tile/group starts are
+                # multiples of 32. Within a group only the atom's row%32 mode
+                # varies (stride 16); derive the base from the canonical layout
+                # once so K-block and outer-atom strides need no duplication.
+                scale_row = work.cumulative_sf_physical_row + group_row + lane_row
+                scale_ptr = cute.recast_ptr(
+                    fc1_output_scales.iterator, dtype=cutlass.Uint8
+                ) + cute.crd2idx(
+                    (scale_row, block * Int32(32), Int32(0)), fc1_output_scales.layout
+                )
+                for token in cutlass.range_constexpr(8):
+                    row_offset = (token // 2) * 8 + token % 2
+                    valid = (
+                        Int32(token_group * 32 + row_offset) + lane_row
+                        < work.valid_tokens_in_cta_tile
+                    )
+                    _store_predicated_u8(
+                        scale_ptr, scales[token], valid, row_offset * 16
+                    )
+            if cutlass.const_expr(self.fc1_tma_store):
+                if full_group:
+                    # STSM transposes the native register map into token-major
+                    # rows, replacing sixteen shared byte stores per lane.
+                    packed = cute.recast_tensor(staged_bytes, cutlass.Uint32)
+                    store_native_e4m3(
+                        stage.iterator,
+                        cute.crd2idx(
+                            (lane_idx, (warp_idx % Int32(4)) * Int32(16)), stage.layout
+                        ),
+                        packed[0],
+                        packed[1],
+                        packed[2],
+                        packed[3],
+                    )
+                cute.arch.fence_proxy("async.shared", space="cta")
+            if cutlass.const_expr(self.iket_fine_ctas > 0):
+                if fine_cta:
+                    self._iket.range_pop()
+                    self._iket.range_push("fc1_group_bar")
+            boundary.arrive_and_wait()
+            if cutlass.const_expr(self.iket_fine_ctas > 0):
+                if fine_cta:
+                    self._iket.range_pop()
+            if cutlass.const_expr(self.fc1_tma_store):
+                if full_group and warp_idx % Int32(4) == Int32(0):
+                    with cute.arch.elect_one():
+                        issue_fc1_store(
+                            fc1_store[0],
+                            fc1_store[1],
+                            stage,
+                            work.cumulative_data_physical_row
+                            + work.tile_n_idx * Int32(self.config.cta_tile_tokens)
+                            + Int32(token_group * 32),
+                            work.tile_m_idx * Int32(64),
+                        )
         else:
-            for feature in cutlass.range_constexpr(half):
-                epilogue_exchange[pair_idx, lane_idx, feature] = token_major[feature]
-        boundary.arrive_and_wait()
-        gate = cute.make_rmem_tensor(self.fc1.half_rmem_layout().shape, cutlass.Float32)
-        up = cute.make_rmem_tensor(self.fc1.half_rmem_layout().shape, cutlass.Float32)
-        if is_gate_warp:
-            for feature in cutlass.range_constexpr(half):
-                gate[feature] = token_major[feature]
-                up[feature] = epilogue_exchange[pair_idx, lane_idx, feature]
-        else:
-            for feature in cutlass.range_constexpr(half):
-                gate[feature] = epilogue_exchange[pair_idx, lane_idx, half + feature]
-                up[feature] = token_major[half + feature]
-        swiglu, half_amax = self.fc1.swiglu_half(gate, up)
-        own_row = Int32(WARP_SIZE) + (warp_idx & Int32(1))
-        other_row = Int32(WARP_SIZE + 1) - (warp_idx & Int32(1))
-        epilogue_exchange[pair_idx, own_row, lane_idx] = half_amax
-        boundary.arrive_and_wait()
-        block_amax = cute.arch.fmax(
-            half_amax, epilogue_exchange[pair_idx, other_row, lane_idx]
-        )
-        quantized, raw_scale = self.fc1.quantize_half(swiglu, block_amax)
-        token_offset = Int32(token_group * WARP_SIZE) + lane_idx
-        if token_offset < work.valid_tokens_in_cta_tile:
-            data_token = (
-                work.cumulative_data_physical_row
-                + work.tile_n_idx * Int32(self.config.cta_tile_tokens)
-                + token_offset
+            # Diagnostic transpose path for the same gate8/up8 physical rows.
+            native = self._load_native_feature_group(
+                tmem_acc_tensor, warp_idx, Int32(token_group), acc_stage
             )
-            scale_token = (
-                work.cumulative_sf_physical_row
-                + work.tile_n_idx * Int32(self.config.cta_tile_tokens)
-                + token_offset
+            token_major = self._transpose_to_token_major(native, lane_idx)
+            gate = cute.make_rmem_tensor(
+                self.fc1.half_rmem_layout().shape, cutlass.Float32
             )
-            intermediate_block = work.tile_m_idx * Int32(2) + pair_idx
-            self._store_fc1_half(
-                quantized,
-                raw_scale,
-                fc1_output,
-                fc1_output_scales,
-                data_token,
-                scale_token,
-                intermediate_block,
-                warp_idx & Int32(1),
+            up = cute.make_rmem_tensor(
+                self.fc1.half_rmem_layout().shape, cutlass.Float32
             )
-        boundary.arrive_and_wait()
+            for feature in cutlass.range_constexpr(16):
+                row = (feature // 8) * 16 + feature % 8
+                gate[feature], up[feature] = token_major[row], token_major[row + 8]
+            values, half_amax = self.fc1.swiglu_half(gate, up)
+            epilogue_exchange[pair_idx, warp_idx % Int32(2), lane_idx] = half_amax
+            boundary.arrive_and_wait()
+            block_amax = cute.arch.fmax(
+                half_amax,
+                epilogue_exchange[pair_idx, Int32(1) - warp_idx % Int32(2), lane_idx],
+            )
+            quantized, raw_scale = self.fc1.quantize_half(values, block_amax)
+            token_offset = Int32(token_group * 32) + lane_idx
+            if token_offset < work.valid_tokens_in_cta_tile:
+                data_token = (
+                    work.cumulative_data_physical_row
+                    + work.tile_n_idx * Int32(self.config.cta_tile_tokens)
+                    + token_offset
+                )
+                scale_token = (
+                    work.cumulative_sf_physical_row
+                    + work.tile_n_idx * Int32(self.config.cta_tile_tokens)
+                    + token_offset
+                )
+                block = work.tile_m_idx * Int32(2) + pair_idx % Int32(2)
+                self._store_fc1_half(
+                    quantized,
+                    raw_scale,
+                    fc1_output,
+                    fc1_output_scales,
+                    data_token,
+                    scale_token,
+                    block,
+                    warp_idx % Int32(2),
+                )
+            boundary.arrive_and_wait()
 
     @cute.jit
     def _store_fc1_half(
@@ -640,12 +775,27 @@ class PersistentMxfp8Mxfp4Epilogue:
         token_metadata,
         warp_idx,
         lane_idx,
+        warpgroup_idx,
     ) -> None:
         """Traverse FC2 TMEM and store unweighted BF16 route terms."""
 
         for token_group in cutlass.range_constexpr(self.config.token_groups):
-            if cutlass.const_expr(self.config.skip_empty_fc2_groups):
-                if Int32(token_group * WARP_SIZE) < work.valid_tokens_in_cta_tile:
+            if cutlass.const_expr(self.config.epilogue_warps == 4) or (
+                Int32(token_group % 2) == warpgroup_idx
+            ):
+                if cutlass.const_expr(self.config.skip_empty_fc2_groups):
+                    if Int32(token_group * WARP_SIZE) < work.valid_tokens_in_cta_tile:
+                        self._run_fc2_token_group(
+                            work=work,
+                            token_group=token_group,
+                            tmem_acc_tensor=tmem_acc_tensor,
+                            acc_stage=acc_stage,
+                            route_store=route_store,
+                            token_metadata=token_metadata,
+                            warp_idx=warp_idx,
+                            lane_idx=lane_idx,
+                        )
+                else:
                     self._run_fc2_token_group(
                         work=work,
                         token_group=token_group,
@@ -656,17 +806,6 @@ class PersistentMxfp8Mxfp4Epilogue:
                         warp_idx=warp_idx,
                         lane_idx=lane_idx,
                     )
-            else:
-                self._run_fc2_token_group(
-                    work=work,
-                    token_group=token_group,
-                    tmem_acc_tensor=tmem_acc_tensor,
-                    acc_stage=acc_stage,
-                    route_store=route_store,
-                    token_metadata=token_metadata,
-                    warp_idx=warp_idx,
-                    lane_idx=lane_idx,
-                )
 
     @cute.jit
     def _run_fc2_token_group(
@@ -701,9 +840,12 @@ class PersistentMxfp8Mxfp4Epilogue:
                 source_rank, source_token, source_topk = _load_route_metadata(
                     token_metadata, pool_token
                 )
+            feature_warp_idx = warp_idx
+            if cutlass.const_expr(self.config.epilogue_warps == 8):
+                feature_warp_idx = warp_idx % Int32(4)
             hidden_col_start = work.tile_m_idx * Int32(
                 self.config.cta_tile_features
-            ) + warp_idx * Int32(FC2_EPILOGUE_TILE)
+            ) + feature_warp_idx * Int32(FC2_EPILOGUE_TILE)
             self.fc2_subtile.store_rmem_subtile(
                 token_major,
                 route_store,
@@ -725,6 +867,7 @@ class PersistentMxfp8Mxfp4Epilogue:
         route_store: Fc2RouteStore,
         fc1_done_counter: cute.Tensor,
         epilogue_exchange: cute.Tensor,
+        fc1_store,
         warp_idx,
         tidx,
         token_metadata=None,
@@ -734,7 +877,7 @@ class PersistentMxfp8Mxfp4Epilogue:
     ) -> None:
         """Consume and retire all persistent FC1/FC2 work records.
 
-        Publication happens after a four-warp CTA barrier and a device-scope
+        Publication happens after an all-epilogue barrier and a device-scope
         fence.  The FC1 release-add unlocks FC2 mainloop work.  The optional
         FC2 release-add unlocks dispatch-warp token-back after all feature
         and token tiles for an expert have reached the local BF16 pool.
@@ -750,7 +893,19 @@ class PersistentMxfp8Mxfp4Epilogue:
             barrier_id=self.config.barrier_id,
             num_threads=self.config.epilogue_warps * WARP_SIZE,
         )
+        # Only the tile boundary spans both warpgroups. E1 can leave one
+        # warpgroup with fewer groups (or none), so exchange barriers cannot.
+        warpgroup_idx = warp_idx // Int32(4)
+        exchange_boundary = boundary
+        if cutlass.const_expr(self.config.epilogue_warps == 8):
+            exchange_boundary = pipeline.NamedBarrier(
+                barrier_id=Int32(EXCHANGE_BARRIER_IDS[0]) + warpgroup_idx,
+                num_threads=4 * WARP_SIZE,
+            )
         lane_idx = tidx % Int32(WARP_SIZE)
+        fine_cta = cutlass.Boolean(False)
+        if cutlass.const_expr(self.iket_fine_ctas > 0):
+            fine_cta = is_fine_cta(self.iket_fine_ctas)
         if cutlass.const_expr(stats is not None):
             loop_start = globaltimer_lo()
         work = scheduler_consumer.consume_work()
@@ -759,7 +914,15 @@ class PersistentMxfp8Mxfp4Epilogue:
             # the epilogue to consume an accumulator before its pipeline stage.
             if cutlass.const_expr(stats is not None):
                 waited = globaltimer_lo()
+            if cutlass.const_expr(self.iket):
+                self._iket.range_push("epi_wait_acc")
             acc_pipeline.consumer_wait(consumer_state)
+            if cutlass.const_expr(self.iket):
+                self._iket.range_pop()
+                if work.phase == Int32(DevicePhase.FC1):
+                    self._iket.range_push("epi_fc1")
+                else:
+                    self._iket.range_push("epi_fc2")
             if cutlass.const_expr(stats is not None):
                 tile_start = globaltimer_lo()
                 if tidx == Int32(0):
@@ -777,9 +940,12 @@ class PersistentMxfp8Mxfp4Epilogue:
                     fc1_output=fc1_output,
                     fc1_output_scales=fc1_output_scales,
                     epilogue_exchange=epilogue_exchange,
-                    boundary=boundary,
+                    fc1_store=fc1_store,
+                    boundary=exchange_boundary,
                     warp_idx=warp_idx,
                     lane_idx=lane_idx,
+                    warpgroup_idx=warpgroup_idx,
+                    fine_cta=fine_cta,
                 )
             else:
                 self._run_fc2_task_tile(
@@ -790,6 +956,7 @@ class PersistentMxfp8Mxfp4Epilogue:
                     token_metadata=token_metadata,
                     warp_idx=warp_idx,
                     lane_idx=lane_idx,
+                    warpgroup_idx=warpgroup_idx,
                 )
 
             # Every LDTM has completed before the accumulator slot is handed
@@ -798,7 +965,32 @@ class PersistentMxfp8Mxfp4Epilogue:
             acc_pipeline.consumer_release(consumer_state)
             consumer_state.advance()
 
+            # Full completion, not just SMEM-read completion: FC2 consumes
+            # these bytes through TMA as soon as the release counter is visible.
+            if cutlass.const_expr(self.fc1_tma_store):
+                if work.phase == Int32(DevicePhase.FC1) and warp_idx % Int32(
+                    4
+                ) == Int32(0):
+                    with cute.arch.elect_one():
+                        cute.arch.cp_async_bulk_wait_group(0, read=False)
+            # Tile end, then the FC1-done publication (warp 0 only: tid 0
+            # issues the GPU-scope fence and release-add).
+            if cutlass.const_expr(self.iket_fine_ctas > 0):
+                if fine_cta and work.phase == Int32(DevicePhase.FC1):
+                    self._iket.range_push("fc1_tile_bar")
             boundary.arrive_and_wait()
+            if cutlass.const_expr(self.iket_fine_ctas > 0):
+                if fine_cta and work.phase == Int32(DevicePhase.FC1):
+                    self._iket.range_pop()
+            if cutlass.const_expr(self.iket):
+                self._iket.range_pop()
+            if cutlass.const_expr(self.iket_fine_ctas > 0):
+                if (
+                    fine_cta
+                    and work.phase == Int32(DevicePhase.FC1)
+                    and warp_idx == Int32(0)
+                ):
+                    self._iket.range_push("fc1_publish")
             if tidx == Int32(0):
                 cute.arch.fence_acq_rel_gpu()
                 if work.phase == Int32(DevicePhase.FC1):
@@ -840,6 +1032,13 @@ class PersistentMxfp8Mxfp4Epilogue:
                             ),
                             Int32(1),
                         )
+            if cutlass.const_expr(self.iket_fine_ctas > 0):
+                if (
+                    fine_cta
+                    and work.phase == Int32(DevicePhase.FC1)
+                    and warp_idx == Int32(0)
+                ):
+                    self._iket.range_pop()
 
             work = scheduler_consumer.consume_work()
         if cutlass.const_expr(stats is not None):
@@ -853,12 +1052,15 @@ class PersistentMxfp8Mxfp4Epilogue:
 __all__ = [
     "DeviceEpilogueConfig",
     "EPILOGUE_WARPS",
+    "EPILOGUE_WARPS_ENV",
     "PersistentMxfp8Mxfp4Epilogue",
     "TOKEN_METADATA_BYTES",
     "TMEM_ROW_STRIDE",
     "EXCHANGE_LANE_STRIDE",
     "EXCHANGE_ROWS",
     "EXCHANGE_WORDS",
+    "EXCHANGE_BARRIER_IDS",
     "WARP_SIZE",
+    "epilogue_warps_from_env",
     "route_metadata_host",
 ]

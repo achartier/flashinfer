@@ -4,9 +4,10 @@
 """FC1 epilogue for the SM100 MXFP8 x MXFP4 MegaMoE kernel.
 
 The mainloop uses swap-AB orientation and leaves FP32 gate/up accumulators in
-TMEM.  This component consumes one gate/up pair of 32-wide intermediate
-subtiles per warp.  After the TMEM load every lane owns one token's complete
-contiguous K32 block, so MX block scaling is lane-local:
+TMEM.  This component provides FP32 arithmetic and quantization for the persistent
+epilogue. The native path distributes a K32 block across lanes and paired
+warps; the diagnostic token-major path uses lane-local fragments. Both use
+the same numerical primitives:
 
 1. optionally clamp ``gate`` above and ``up`` on both sides in FP32;
 2. evaluate ``up * (gate * sigmoid(gate))`` in FP32;
@@ -16,12 +17,11 @@ contiguous K32 block, so MX block scaling is lane-local:
 
 There is deliberately no BF16 conversion and no routing-weight multiplication
 at this boundary.  This is the deterministic handoff specified by
-the independent reference; FC2 and the output reducer own routing weights.
+``CONTRACT.md``; FC2 and the output reducer own routing weights.
 
-The integration-facing API is intentionally narrow.  The persistent kernel
-selects the gate/up TMEM subtiles, computes the destination token and
-intermediate-block indices, then calls :meth:`Fc1Epilogue.run_subtile`.
-Publication counters remain scheduler-owned.
+The persistent epilogue owns TMEM traversal, cross-lane amax reduction,
+stores, and readiness publication. The standalone token-major helpers remain
+available for diagnostic and component use.
 """
 
 from __future__ import annotations
@@ -104,7 +104,7 @@ def _ue8m0_to_inv_scale_contract(raw_scale, *, loc=None, ip=None):
     """Decode the reciprocal of every finite E8M0 code, including code zero.
 
     The generic quantization helper treats raw zero as a zero-scale sentinel.
-    The reference instead defines it as the finite scale ``2**-127``.  The
+    ``CONTRACT.md`` instead defines it as the finite scale ``2**-127``.  The
     difference only affects extremely small nonzero blocks, but preserving it
     here makes the kernel recipe complete rather than relying on underflow.
     """
@@ -197,7 +197,7 @@ def _clamp_and_swiglu(
             ftz=fast_math,
         )
 
-        # Keep this association synchronized with reference.py.
+        # Keep this association synchronized with CONTRACT.md and reference.py.
         silu0, silu1 = cute.arch.mul_packed_f32x2(
             (g0, g1), (sigmoid0, sigmoid1), rnd="rn", ftz=False
         )

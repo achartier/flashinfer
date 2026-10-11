@@ -236,7 +236,7 @@ def _add_rn_f32(
 
 
 class DeterministicTopKReducer:
-    """External BF16-route-term reducer with a fixed ascending slot order.
+    """BF16-route-term reducer with a fixed ascending slot order.
 
     ``route_ids`` is required so the ``-1`` sentinel ignores its score even if
     the caller filled that score with a nonzero value.  All other ids are
@@ -410,11 +410,36 @@ class DeterministicTopKReducer:
         )
 
 
+class InKernelTopKReduction:
+    """Trace-time operands for the all-warp persistent tail callback."""
+
+    def __init__(self, *, hidden, num_topk, route_terms, output):
+        self.reducer = DeterministicTopKReducer(hidden=hidden, num_topk=num_topk)
+        self.route_terms = route_terms
+        self.output = output
+
+    @cute.jit
+    def __call__(self, args, cta_linear_id, tidx, threads_per_cta: cutlass.Constexpr):
+        terms, scores, ids, output = self.reducer.views(
+            self.route_terms,
+            args.input_topk_weights_buffer,
+            args.topk_idx,
+            self.output,
+        )
+        worker = cta_linear_id * Int32(threads_per_cta) + tidx
+        stride = Int32(args.sm_count * threads_per_cta)
+        total = output.shape[0] * Int32(self.reducer.hidden_tiles)
+        while worker < total:
+            self.reducer.reduce_worker(terms, scores, ids, output, worker)
+            worker = worker + stride
+
+
 __all__ = [
     "DeterministicTopKReducer",
     "FC2_EPILOGUE_TILE",
     "Fc2Bf16Epilogue",
     "Fc2RouteStore",
+    "InKernelTopKReduction",
     "REDUCE_HIDDEN_PER_THREAD",
     "REDUCE_THREADS",
     "validate_fc2_contract",

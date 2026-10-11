@@ -71,7 +71,7 @@ class CutePackedWeightViews:
 class PackedWeightViews:
     """Validate transformed weights and expose zero-copy logical CuTe views.
 
-    FC1's M coordinate is already gate32/up32 interleaved by preprocessing.
+    FC1's M coordinate is already gate8/up8 interleaved by preprocessing.
     This adapter deliberately preserves that row order.  FC2 uses the same
     K-major physical contract without the gate/up row transform.
     """

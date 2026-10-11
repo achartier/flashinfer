@@ -10,7 +10,11 @@ The scheduler walks this hierarchy::
 
     group -> FC1/FC2 phase -> expert -> token block -> feature block
 
-Each group completes all FC1 work before any FC2 work.  Token blocks are the
+Static and atomic-counter modes order all FC1 claims before FC2 in each
+group. ``AlternatingTileClaimer`` instead claims from two whole-batch task
+spaces after an FC1 warm-up; ``record_for_alternating`` decodes its signed
+phase-local indices. FC2 cannot be returned until its FC1 tasks are claimed.
+Token blocks are the
 slow axis in both phases.  ``tile_m_idx`` is the feature tile and
 ``tile_n_idx`` is the token tile, matching the swap-AB kernel orientation.
 
@@ -262,6 +266,78 @@ class AtomicTileClaimer:
         return result
 
 
+def get_num_fc1_warmup_waves(total_blocks, clusters, fc1_n, fc2_n):
+    """Warm-up bound for whole-batch FC1/FC2 alternation.
+
+    Cover every token block touched by the first FC2 wave, and leave enough
+    FC1 waves ahead that the narrower FC2 task space cannot catch its frontier.
+    There is no pool-ring bound: MegaMoE retains the full FC1 intermediate.
+    """
+    if total_blocks == 0:
+        return 0
+    first_wave_blocks = min(total_blocks, _ceil_div(clusters, fc2_n))
+    cover_first_wave = _ceil_div(first_wave_blocks * fc1_n, clusters)
+    prevent_catchup = (
+        _ceil_div(fc1_n + (total_blocks - 1) * max(fc1_n - fc2_n, 0), clusters) + 1
+    )
+    return min(
+        _ceil_div(total_blocks * fc1_n, clusters),
+        max(cover_first_wave, prevent_catchup),
+    )
+
+
+class AlternatingTileClaimer:
+    """One cluster's state, with two counters shared by all clusters.
+
+    ``claim`` returns None while a late FC2 claim waits for the FC1 frontier.
+    The caller must let other clusters progress and retry. DONE is encoded as
+    INT32_MAX; FC1 uses nonnegative indices and FC2 uses -(index + 1).
+    """
+
+    DONE = (1 << 31) - 1
+
+    def __init__(self, config, fc1_counter, fc2_counter):
+        blocks = sum(
+            _ceil_div(n, config.cluster_tile_m) for n in config.expert_token_counts
+        )
+        self.fc1_n = config.fc1_feature_blocks
+        self.fc2_n = config.fc2_feature_blocks
+        self.total_fc1 = blocks * self.fc1_n
+        self.total_fc2 = blocks * self.fc2_n
+        self.pending = get_num_fc1_warmup_waves(
+            blocks, config.num_persistent_clusters, self.fc1_n, self.fc2_n
+        )
+        self.fc1_counter = fc1_counter
+        self.fc2_counter = fc2_counter
+        self.fc1_exhausted = False
+        self.fc2_exhausted = False
+        self.waiting = None
+
+    def claim(self):
+        while self.waiting is None:
+            if self.fc1_exhausted and self.fc2_exhausted:
+                return self.DONE
+            if self.pending or self.fc2_exhausted:
+                index = self.fc1_counter.claim()
+                if index < self.total_fc1:
+                    self.pending = max(0, self.pending - 1)
+                    return index
+                self.fc1_exhausted = True
+                self.pending = 0
+            else:
+                index = self.fc2_counter.claim()
+                self.pending = int(not self.fc1_exhausted)
+                if index < self.total_fc2:
+                    self.waiting = index
+                else:
+                    self.fc2_exhausted = True
+        index = self.waiting
+        if self.fc1_counter.value < (index // self.fc2_n + 1) * self.fc1_n:
+            return None
+        self.waiting = None
+        return -(index + 1)
+
+
 class PersistentFc1Fc2Scheduler:
     """Host specification for the fused persistent scheduler state machine."""
 
@@ -368,6 +444,20 @@ class PersistentFc1Fc2Scheduler:
             phase_and_peek=int(work.phase),
         )
 
+    def record_for_alternating(self, claim, *, cta_coord_mn=(0, 0)):
+        """Decode the signed phase-local claim, ignoring group_hint."""
+        if claim == AlternatingTileClaimer.DONE:
+            return WorkRecord.done()
+        phase = Phase.FC1 if claim >= 0 else Phase.FC2
+        index = claim if claim >= 0 else -claim - 1
+        # Reuse the canonical record decoder, with the phase-local ordering.
+        indices = [
+            i for i, work in enumerate(self._cluster_work) if work.phase == phase
+        ]
+        if index >= len(indices):
+            return WorkRecord.done()
+        return self.record_for(indices[index], cta_coord_mn=cta_coord_mn)
+
     def enrich_readiness_peek(
         self,
         record: WorkRecord,
@@ -416,6 +506,8 @@ class PersistentFc1Fc2Scheduler:
 
 
 __all__ = [
+    "AlternatingTileClaimer",
+    "get_num_fc1_warmup_waves",
     "AtomicTileClaimer",
     "DONE_EXPERT",
     "PEEK_READY_BIT",

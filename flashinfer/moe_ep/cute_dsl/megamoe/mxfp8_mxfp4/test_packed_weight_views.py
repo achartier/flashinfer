@@ -25,7 +25,7 @@ def test_b200_reads_fc1_fc2_nibbles_through_explicit_logical_layout() -> None:
     from cutlass.cute.runtime import from_dlpack
 
     from flashinfer.moe_ep.backends.mega.kernel.sm100.mxfp8_mxfp4_bf16_cutedsl.weights import (
-        _interleave_gate_up_32,
+        _interleave_gate_up_8,
     )
 
     from .packed_weight_views import PackedWeightViews
@@ -34,8 +34,8 @@ def test_b200_reads_fc1_fc2_nibbles_through_explicit_logical_layout() -> None:
 
     # Physical preprocessing ABI before the transpose is (E,M,K/2).  Use a
     # constant E2M1 code per row/expert so each sampled logical coordinate has
-    # an unambiguous expected value.  FC1 rows 0..31 and 32..63 model the first
-    # gate32/up32 pair produced by preprocessing.
+    # an unambiguous expected value.  FC1 rows 0..7 and 8..15 model the first
+    # gate8/up8 pair produced by preprocessing.
     canonical_fc1_emk = torch.zeros(
         (experts, 2 * intermediate, hidden // 2),
         dtype=torch.uint8,
@@ -44,7 +44,7 @@ def test_b200_reads_fc1_fc2_nibbles_through_explicit_logical_layout() -> None:
     canonical_fc1_emk[0, 0].fill_(0x22)  # gate row 0: code 2 -> 1.0
     canonical_fc1_emk[0, intermediate].fill_(0x44)  # up row 0: code 4 -> 2.0
     canonical_fc1_emk[1, intermediate].fill_(0x66)  # expert 1: code 6 -> 4.0
-    fc1_emk = _interleave_gate_up_32(canonical_fc1_emk, intermediate_size=intermediate)
+    fc1_emk = _interleave_gate_up_8(canonical_fc1_emk, intermediate_size=intermediate)
     fc2_emk = torch.zeros(
         (experts, hidden, intermediate // 2),
         dtype=torch.uint8,
@@ -85,8 +85,8 @@ def test_b200_reads_fc1_fc2_nibbles_through_explicit_logical_layout() -> None:
                 fc1_bytes = cute.recast_tensor(fc1_logical, cutlass.Uint8)
                 fc2_bytes = cute.recast_tensor(fc2_logical, cutlass.Uint8)
                 destination[0] = cutlass.Float32(fc1_bytes[0, 0, 0])
-                destination[1] = cutlass.Float32(fc1_bytes[32, 0, 0])
-                destination[2] = cutlass.Float32(fc1_bytes[32, 0, 1])
+                destination[1] = cutlass.Float32(fc1_bytes[8, 0, 0])
+                destination[2] = cutlass.Float32(fc1_bytes[8, 0, 1])
                 destination[3] = cutlass.Float32(fc2_bytes[7, 0, 1])
 
     compiled = cute.compile(

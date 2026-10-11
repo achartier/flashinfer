@@ -9,7 +9,7 @@ import torch
 
 from flashinfer.moe_ep.cute_dsl.megamoe.mxfp8_mxfp4.reference import (
     compute_reference,
-    interleave_gate_up_32,
+    interleave_gate_up_8,
     quantize_mxfp4,
     quantize_mxfp8,
 )
@@ -28,7 +28,7 @@ def _oracle_problem(
     w2 = torch.randn((experts, hidden, intermediate), generator=generator) / (
         intermediate**0.5
     )
-    w13_packed, w13_scale = quantize_mxfp4(interleave_gate_up_32(w13))
+    w13_packed, w13_scale = quantize_mxfp4(interleave_gate_up_8(w13))
     w2_packed, w2_scale = quantize_mxfp4(w2)
     slots = 4
     token_idx = torch.arange(tokens).view(1, tokens, 1)

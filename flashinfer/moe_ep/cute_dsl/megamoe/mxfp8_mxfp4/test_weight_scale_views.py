@@ -37,14 +37,20 @@ def test_fc1_gate_up_interleave_is_preserved_by_atom_layout() -> None:
     canonical = torch.arange(2 * intermediate, dtype=torch.int64)[:, None].expand(
         -1, hidden // 32
     )
-    interleaved = torch.empty_like(canonical).view(-1, 2, 32, hidden // 32)
-    interleaved[:, 0].copy_(canonical[:intermediate].view(-1, 32, hidden // 32))
-    interleaved[:, 1].copy_(canonical[intermediate:].view(-1, 32, hidden // 32))
+    interleaved = torch.empty_like(canonical).view(-1, 2, 8, hidden // 32)
+    interleaved[:, 0].copy_(canonical[:intermediate].view(-1, 8, hidden // 32))
+    interleaved[:, 1].copy_(canonical[intermediate:].view(-1, 8, hidden // 32))
     physical = to_atom_swizzled(interleaved.reshape(2 * intermediate, -1))
 
     restored = from_atom_swizzled(physical, rows=2 * intermediate, k_elements=hidden)
-    assert torch.equal(restored[:32], canonical[:32])
-    assert torch.equal(restored[32:64], canonical[intermediate : intermediate + 32])
+    for block in range(intermediate // 8):
+        assert torch.equal(
+            restored[16 * block : 16 * block + 8], canonical[8 * block : 8 * block + 8]
+        )
+        assert torch.equal(
+            restored[16 * block + 8 : 16 * block + 16],
+            canonical[intermediate + 8 * block : intermediate + 8 * block + 8],
+        )
 
 
 def test_adapter_freezes_swap_ab_shapes_and_flat_extents() -> None:

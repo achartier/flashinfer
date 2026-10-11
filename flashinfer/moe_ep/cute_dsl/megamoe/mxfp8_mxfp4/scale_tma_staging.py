@@ -295,23 +295,15 @@ class Mxfp8Mxfp4TmaStaging:
         return (*tma_a, *tma_b, *tma_sfa, tma_atom_sfb, tma_tensor_sfb)
 
     def _normalize_sfb_tma_tensor(self, tma_tensor_sfb: cute.Tensor):
-        """Repair the overlapping logical SFB blocks for a 192-column tile."""
-        if cutlass.const_expr(self.cta_tile_shape_mnk[1] == 192):
-            x = tma_tensor_sfb.stride[0][1]
-            y = cute.ceil_div(tma_tensor_sfb.shape[0][1], 4)
-            layout = cute.make_layout(
-                (
-                    (tma_tensor_sfb.shape[0][0], ((2, 2), y)),
-                    tma_tensor_sfb.shape[1],
-                    tma_tensor_sfb.shape[2],
-                ),
-                stride=(
-                    (tma_tensor_sfb.stride[0][0], ((x, x), 3 * x)),
-                    tma_tensor_sfb.stride[1],
-                    tma_tensor_sfb.stride[2],
-                ),
-            )
-            return cute.make_tensor(tma_tensor_sfb.iterator, layout)
+        """Identity: N192 SFB tiles are addressed by atom offset instead.
+
+        CUTLASS's dense block-scaled GEMM repairs overlapping 192-column SFB
+        blocks with an overlapping-stride layout.  This kernel offsets every
+        work tile's scale rows with ``cute.domain_offset`` (per expert), which
+        assumes a linear row mapping, so the driver instead offsets N192 tiles
+        to the 128-row atom holding their first token and loads a 256-row
+        tile from there (``sfb_atom_tile`` is 0 for N192).
+        """
         return tma_tensor_sfb
 
     def make_multicast_masks(
@@ -323,24 +315,27 @@ class Mxfp8Mxfp4TmaStaging:
         num_mcast_a = cute.size(self.cluster_layout_vmnk.shape[2])
         num_mcast_b = cute.size(self.cluster_layout_vmnk.shape[1])
         num_mcast_sfb = cute.size(self.cluster_layout_sfb_vmnk.shape[1])
+        # 2-CTA TMA loads always carry masks, as in the reference swap-AB
+        # kernel (kernel_fc12), even when no operand is multicast.
+        two_cta = self.cta_group == tcgen05.CtaGroup.TWO
         mask_a = None
         mask_b = None
         mask_sfa = None
         mask_sfb = None
-        if cutlass.const_expr(num_mcast_a > 1):
+        if cutlass.const_expr(num_mcast_a > 1 or two_cta):
             mask_a = cpasync.create_tma_multicast_mask(
                 self.cluster_layout_vmnk,
                 block_in_cluster_coord_vmnk,
                 mcast_mode=2,
             )
             mask_sfa = mask_a
-        if cutlass.const_expr(num_mcast_b > 1):
+        if cutlass.const_expr(num_mcast_b > 1 or two_cta):
             mask_b = cpasync.create_tma_multicast_mask(
                 self.cluster_layout_vmnk,
                 block_in_cluster_coord_vmnk,
                 mcast_mode=1,
             )
-        if cutlass.const_expr(num_mcast_sfb > 1):
+        if cutlass.const_expr(num_mcast_sfb > 1 or two_cta):
             mask_sfb = cpasync.create_tma_multicast_mask(
                 self.cluster_layout_sfb_vmnk,
                 block_in_cluster_coord_sfb_vmnk,
@@ -391,6 +386,9 @@ class Mxfp8Mxfp4TmaStaging:
 
     def sfb_atom_tile(self, tile_n_idx):
         """Index of the 128-row SFB TMA tile that holds token tile ``tile_n_idx``."""
+        if cutlass.const_expr(self.mma_tiler[1] == 192):
+            # The driver's SFB row offset already selects the tile's atom.
+            return cutlass.Int32(0)
         if cutlass.const_expr(self.sfb_tiles_per_atom == 1):
             return tile_n_idx
         return tile_n_idx // cutlass.Int32(self.sfb_tiles_per_atom)
@@ -402,6 +400,16 @@ class Mxfp8Mxfp4TmaStaging:
         the whole atom and the MMA must start at this tile's 32-row group:
         one TMEM word per 32 rows, as in CUTLASS's dense block-scaled GEMM.
         """
+        if cutlass.const_expr(self.mma_tiler[1] == 192):
+            # N192: the SFB tile starts at the atom holding the tile's first
+            # row (driver offset); odd tiles start 64 rows into it, i.e. two
+            # TMEM words (as in CUTLASS's dense block-scaled GEMM).
+            sfa_cols, _, _ = self.tmem_column_counts()
+            shift = (tile_n_idx % cutlass.Int32(2)) * cutlass.Int32(2)
+            shifted = cute.recast_ptr(
+                base_ptr + column_offset + sfa_cols + shift, dtype=self.scale_dtype
+            )
+            return cute.make_tensor(shifted, tmem_sfb.layout)
         if cutlass.const_expr(self.sfb_tiles_per_atom == 1):
             return tmem_sfb
         sfa_cols, _, _ = self.tmem_column_counts()
@@ -543,9 +551,15 @@ class Mxfp8Mxfp4TmaStaging:
         indexes it with the producer state's monotonically increasing count.
         """
         tile_m, tile_n, tile_l = tile_mnl
+        if cutlass.const_expr(self.cta_group == tcgen05.CtaGroup.TWO):
+            # A/SFA are tiled by the 256-row pair tile; the scheduler's
+            # tile_m is the per-CTA 128-row index (2 * pair + v).
+            tile_m = tile_m // 2
         sfb_n = tile_n
         if cutlass.const_expr(self.cta_tile_shape_mnk[1] == 64):
             sfb_n = tile_n // 2
+        if cutlass.const_expr(self.cta_tile_shape_mnk[1] == 192):
+            sfb_n = self.sfb_atom_tile(tile_n)
         return (
             global_a[(None, tile_m, None, tile_l)],
             global_b[(None, tile_n, None, tile_l)],

@@ -159,7 +159,7 @@ class CuteWeightScaleArguments:
 class SwizzledWeightScaleViews:
     """Validate transformed scale planes and expose zero-copy CuTe SF views.
 
-    FC1 rows already have the preprocessing gate32/up32 interleave.  The
+    FC1 rows already have the preprocessing gate8/up8 interleave.  The
     adapter preserves that M ordering and only supplies the correct atom
     layout; it never transposes or reorders weight scale bytes.
     """
