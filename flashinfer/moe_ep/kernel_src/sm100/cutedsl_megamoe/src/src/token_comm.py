@@ -1787,6 +1787,7 @@ class TokenInPullTokenBackPush:
         warp_idx,
         lane_idx,
         tidx,
+        tail_work: cutlass.Constexpr = None,
     ):
         nb_kernel_tail = pipeline.NamedBarrier(
             barrier_id=self.kernel_tail_named_barrier_id,
@@ -1847,6 +1848,27 @@ class TokenInPullTokenBackPush:
                 local_warp_idx=local_warp_idx,
                 lane_idx=lane_idx,
             )
+
+        if cutlass.const_expr(tail_work is not None):
+            # Reuse the completed all-CTA rendezvous. Dispatch warps have
+            # drained every peer's stores (including dispatch token-back).
+            # Publish that acquire to every warp before reading route terms.
+            nb_kernel_tail.arrive_and_wait()
+            tail_work(
+                token_comm_args,
+                self._cta_linear_id(),
+                tidx,
+                self.kernel_tail_threads,
+            )
+            # Every CTA must finish reading before its dispatch warps enter
+            # the final grid/NVLink barrier and allow peers to relaunch.
+            nb_kernel_tail.arrive_and_wait()
+
+        if (warp_idx >= self.dispatch_warp_start) and (
+            warp_idx < self.dispatch_warp_start + self.num_dispatch_warps
+        ):
+            cta_linear_id = self._cta_linear_id()
+            local_warp_idx = Int32(warp_idx) - Int32(self.dispatch_warp_start)
             self.nvlink_barrier(
                 token_comm_args.nvlink_barrier_signal,
                 token_comm_args.nvlink_barrier_counter,

@@ -44,10 +44,10 @@ def _kernel_fp4_dtype() -> "torch.dtype":
     return getattr(torch, "float4_e2m1fn_x2", torch.uint8)
 
 
-def _interleave_gate_up_32(
+def _interleave_gate_up_8(
     tensor: "torch.Tensor", *, intermediate_size: int
 ) -> "torch.Tensor":
-    """Convert canonical gate||up rows to gate32,up32 alternating blocks."""
+    """Convert canonical gate||up rows to gate8,up8 alternating blocks."""
 
     if intermediate_size % MXFP4_BLOCK_SIZE:
         raise ValueError("MXFP4 MegaMoE requires intermediate_size divisible by 32")
@@ -58,15 +58,11 @@ def _interleave_gate_up_32(
         )
     gate = tensor[:, :intermediate_size].contiguous()
     up = tensor[:, intermediate_size:].contiguous()
-    blocks = intermediate_size // MXFP4_BLOCK_SIZE
+    blocks = intermediate_size // 8
     out = tensor.new_empty(tensor.shape)
-    out_view = out.view(tensor.shape[0], blocks, 2, MXFP4_BLOCK_SIZE, tensor.shape[2])
-    out_view[:, :, 0].copy_(
-        gate.view(tensor.shape[0], blocks, MXFP4_BLOCK_SIZE, tensor.shape[2])
-    )
-    out_view[:, :, 1].copy_(
-        up.view(tensor.shape[0], blocks, MXFP4_BLOCK_SIZE, tensor.shape[2])
-    )
+    out_view = out.view(tensor.shape[0], blocks, 2, 8, tensor.shape[2])
+    out_view[:, :, 0].copy_(gate.view(tensor.shape[0], blocks, 8, tensor.shape[2]))
+    out_view[:, :, 1].copy_(up.view(tensor.shape[0], blocks, 8, tensor.shape[2]))
     return out.contiguous()
 
 
@@ -192,10 +188,10 @@ def preprocess_mega_weights(
         tensors = (weights.w13, weights.w2, weights.w13_scale, weights.w2_scale)
         if len({tensor.device for tensor in tensors}) != 1:
             raise ValueError("prequantized MXFP4 data and scales must share one device")
-        w13_packed = _interleave_gate_up_32(
+        w13_packed = _interleave_gate_up_8(
             weights.w13, intermediate_size=intermediate_size
         )
-        w13_sf = _interleave_gate_up_32(
+        w13_sf = _interleave_gate_up_8(
             weights.w13_scale, intermediate_size=intermediate_size
         )
         w2_packed = weights.w2
@@ -206,7 +202,7 @@ def preprocess_mega_weights(
             logical_w13_shape=logical_w13_shape,
             logical_w2_shape=logical_w2_shape,
         )
-        w13_bf16 = _interleave_gate_up_32(
+        w13_bf16 = _interleave_gate_up_8(
             weights.w13, intermediate_size=intermediate_size
         )
         w13_q: list[torch.Tensor] = []

@@ -84,11 +84,20 @@ class Mxfp8Mxfp4CutedslMegaKernelBackend(MegaKernelBackend):
             num_experts=fleet_params.num_experts,
         )
 
-    def _resolved_tactic(self, max_tokens_per_rank: int) -> dict | None:
+    def _resolved_tactic(self, fleet_params: FleetParams) -> dict | None:
+        """Pinned tactic, or None when the workspace resolves it (knob cache
+        then default for ``knobs=None``; the autotune winner for ``"auto"``)."""
         knobs = self._kernel_config.knobs
-        if knobs == "auto":
+        if knobs is None or knobs == "auto":
             return None
-        return resolve_tactic(max_tokens_per_rank, knobs)
+        return dict(
+            resolve_tactic(
+                fleet_params.max_tokens_per_rank,
+                knobs,
+                hidden=fleet_params.token_hidden_size,
+                intermediate=self._kernel_config.intermediate_size,
+            )
+        )
 
     def _allocate_workspace(self, fleet_params: FleetParams) -> Any:
         # Component 11 owns this integration facade; importing lazily keeps the
@@ -98,6 +107,18 @@ class Mxfp8Mxfp4CutedslMegaKernelBackend(MegaKernelBackend):
         )
 
         cfg = self._kernel_config
+        knobs = self._resolved_tactic(fleet_params)
+        capacity = None
+        if cfg.knobs == "auto":
+            from .config import candidate_tactics
+
+            # Start on the default (cache bypassed) with room for every
+            # candidate the first compute() will time.
+            knobs = {}
+            capacity = candidate_tactics(
+                hidden=fleet_params.token_hidden_size,
+                intermediate=cfg.intermediate_size,
+            )
         return get_symm_buffer_for_mxfp8_mxfp4_mega_moe(
             fleet_params.num_experts,
             fleet_params.max_tokens_per_rank,
@@ -107,7 +128,8 @@ class Mxfp8Mxfp4CutedslMegaKernelBackend(MegaKernelBackend):
             self.ep_rank,
             self.ep_world_size,
             gate_up_clamp=cfg.gate_up_clamp,
-            knobs=self._resolved_tactic(fleet_params.max_tokens_per_rank),
+            knobs=knobs,
+            capacity_tactics=capacity,
         )
 
     def validate_forward(
@@ -195,6 +217,7 @@ class Mxfp8Mxfp4CutedslMegaKernelBackend(MegaKernelBackend):
                 workspace,
                 num_tokens=num_tokens,
                 gate_up_clamp=self._kernel_config.gate_up_clamp,
+                fast_math=self._kernel_config.fast_math,
             )
             self._autotune_pending = False
         view = mxfp8_mxfp4_mega_moe(
@@ -232,7 +255,7 @@ class Mxfp8Mxfp4CutedslMegaKernelBackend(MegaKernelBackend):
             fleet_params.token_hidden_size,
             cfg.intermediate_size,
             cfg.gate_up_clamp,
-            knobs_pool_key(self._resolved_tactic(fleet_params.max_tokens_per_rank)),
+            knobs_pool_key(self._resolved_tactic(fleet_params)),
         )
 
     def _forget_workspace_state(self, workspace: Any) -> None:
@@ -259,7 +282,6 @@ try:
     )
 except ImportError:
     _ASSEMBLY_READY = False
-    _PersistentKernelAdapter = None
 
 if _ASSEMBLY_READY and _PersistentKernelAdapter is not None:
     from ......core.kernel.registry import register_mega_kernel

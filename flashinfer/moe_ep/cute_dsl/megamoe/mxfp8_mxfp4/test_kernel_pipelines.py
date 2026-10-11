@@ -4,6 +4,7 @@
 """Focused storage/layout trace for persistent kernel pipelines."""
 
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
@@ -27,10 +28,10 @@ from .scale_tma_staging import Mxfp8Mxfp4TmaStaging  # noqa: E402
 from .workspace import WorkspaceConfig  # noqa: E402
 
 
-def _make_pipelines(*, mma_m: int = 128, dispatch_start: int = 8):
+def _make_pipelines(*, mma_m: int = 128, mma_n: int = 128, dispatch_start: int = 8):
     cluster_shape_mn = (2, 1) if mma_m == 256 else (1, 1)
     staging = Mxfp8Mxfp4TmaStaging(
-        mma_tiler_mn=(mma_m, 128),
+        mma_tiler_mn=(mma_m, mma_n),
         cluster_shape_mn=cluster_shape_mn,
         num_stages=2,
     )
@@ -52,12 +53,12 @@ def _make_pipelines(*, mma_m: int = 128, dispatch_start: int = 8):
         num_other_warps=8,
     )
     epilogue = PersistentMxfp8Mxfp4Epilogue(
-        DeviceEpilogueConfig(cta_tile_features=128, cta_tile_tokens=128)
+        DeviceEpilogueConfig(cta_tile_features=128, cta_tile_tokens=mma_n)
     )
     # Storage shape depends only on these two scheduler fields.  Device-valued
     # scheduler parameters are supplied by the final driver before it calls
     # create_scheduler.
-    scheduler_shape = SimpleNamespace(num_stages=2, load_balance_mode="static")
+    scheduler_shape: Any = SimpleNamespace(num_stages=2, load_balance_mode="static")
     return KernelPipelines(
         staging=staging,
         scheduler_params=scheduler_shape,
@@ -66,17 +67,68 @@ def _make_pipelines(*, mma_m: int = 128, dispatch_start: int = 8):
     )
 
 
-def test_pipeline_contract_is_m128_one_cta_block32() -> None:
+def test_pipeline_contract_is_m128_or_m256_block32() -> None:
     KernelPipelines.validate_mma_tiler_mn((128, 128))
+    KernelPipelines.validate_mma_tiler_mn((256, 128))
     assert KernelWarpIds().dispatch == (8, 9, 10, 11)
     assert KernelWarpIds().threads_per_cta == 12 * 32
 
 
-def test_pipeline_rejects_two_cta_mma_and_shifted_dispatch_warps() -> None:
+@pytest.mark.parametrize("mega", [False, True])
+@pytest.mark.parametrize("warps", [4, 8])
+def test_epilogue_warpgroup_roles(mega, warps) -> None:
+    ids = KernelWarpIds.for_epilogue(warps, mega=mega)
+    assert len(ids.epilogue) == warps
+    assert ids.threads_per_cta == (warps + 4 + 4 * mega) * 32
+    assert ids.epilogue[:4] == (0, 1, 2, 3)
+    if warps == 8:
+        start = 12 if mega else 8
+        assert ids.epilogue[4:] == tuple(range(start, start + 4))
+    assert ids.dispatch == ((8, 9, 10, 11) if mega else ())
+
+
+def test_epilogue_rejects_mixed_role_warpgroups() -> None:
+    with pytest.raises(ValueError, match="role-pure"):
+        KernelWarpIds(epilogue=(0, 1, 2, 12, 3, 13, 14, 15))
+
+
+@pytest.mark.parametrize("mega", [False, True])
+@pytest.mark.parametrize("n", [64, 128, 192])
+def test_eight_warp_stage_fit_sizes_exchange_storage(mega, n, monkeypatch) -> None:
+    monkeypatch.setenv("FLASHINFER_MXFP8_MXFP4_FC1_TMA_STORE", "1")
+    monkeypatch.delenv("FLASHINFER_MXFP8_MXFP4_FC1_EPI_LEGACY", raising=False)
+    kwargs: dict[str, Any] = dict(
+        mma_tiler_mnk=(256, n, 128),
+        scheduler_params=SimpleNamespace(num_stages=2, load_balance_mode="static"),
+        dispatch_phase=_ep16_dispatch(6400) if mega else None,
+        smem_capacity_bytes=SM100_SMEM_CAPACITY,
+        maximum_stages=12,
+    )
+    four = fit_operand_stages(**kwargs, epilogue_warps=4)
+    eight = fit_operand_stages(**kwargs, epilogue_warps=8)
+    # Two additional pairs each exchange 2 x 32 FP32 maxima.
+    assert eight.fixed_bytes - four.fixed_bytes == 512 + 4096
+    assert eight.stages <= four.stages
+    assert eight.used_bytes <= SM100_SMEM_CAPACITY
+
+
+def test_pipeline_rejects_other_mma_m_and_shifted_dispatch_warps() -> None:
     with pytest.raises(ValueError, match="M128"):
-        KernelPipelines.validate_mma_tiler_mn((256, 128))
+        KernelPipelines.validate_mma_tiler_mn((64, 128))
     with pytest.raises(ValueError, match="distinct"):
         KernelWarpIds(dispatch=(7, 9, 10, 11))
+
+
+def test_two_cta_stage_bytes_are_per_cta() -> None:
+    # Each CTA of a 2-CTA pair stages its own 128 weight rows and half of the
+    # token tile; SFB stays whole (1-CTA SFB view).
+    for n in (64, 128, 192):
+        one = mma_operand_stage_bytes((128, n, 128))
+        two = mma_operand_stage_bytes((256, n, 128))
+        assert two.weight_a == one.weight_a
+        assert two.weight_sfa == one.weight_sfa
+        assert two.activation_b * 2 == one.activation_b
+        assert two.activation_sfb == one.activation_sfb
 
 
 class _PipelineTraceHarness:
@@ -103,8 +155,46 @@ class _PipelineTraceHarness:
         assert pipelines.staging.tma_transaction_bytes_a() == 128 * 128 // 2 + 512
         smem = cutlass.utils.SmemAllocator()
         storage = smem.allocate(pipelines.shared_storage_type())
+        pipelines.allocate_fc1_store_smem(smem)
         pipelines.allocate_operand_smem(smem)
         pipelines.create_mainloop_pipelines(storage)
+
+
+class _TwoCtaPipelineTraceHarness:
+    """Trace the 2-CTA pipelines and tie the host stage bytes to the layouts."""
+
+    def __init__(self, mma_n: int):
+        self.mma_n = mma_n
+
+    @cute.jit
+    def __call__(self, stream):
+        self._kernel().launch(
+            grid=(2, 1, 1),
+            block=(12 * 32, 1, 1),
+            cluster=(2, 1, 1),
+            stream=stream,
+        )
+
+    @cute.kernel
+    def _kernel(self):
+        pipelines = _make_pipelines(mma_m=256, mma_n=self.mma_n)
+        stage_bytes = pipelines.staging.operand_stage_bytes()
+        assert stage_bytes == mma_operand_stage_bytes((256, self.mma_n, 128))
+        smem = cutlass.utils.SmemAllocator()
+        storage = smem.allocate(pipelines.shared_storage_type())
+        pipelines.allocate_fc1_store_smem(smem)
+        pipelines.allocate_operand_smem(smem)
+        pipelines.create_mainloop_pipelines(storage)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("mma_n", [64, 128, 192])
+def test_b200_traces_two_cta_pipelines_and_stage_bytes(mma_n: int) -> None:
+    major, _ = torch.cuda.get_device_capability()
+    if major != 10:
+        pytest.skip("requires an SM100 B200")
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    cute.compile(_TwoCtaPipelineTraceHarness(mma_n), stream)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -161,12 +251,12 @@ def _fit(hidden: int, capacity: int, maximum_stages: int = 8) -> int:
     ).stages
 
 
-def test_stage_fit_capacity_boundary() -> None:
+def test_stage_fit_capacity_boundary(monkeypatch) -> None:
+    monkeypatch.setenv("FLASHINFER_MXFP8_MXFP4_FC1_TMA_STORE", "0")
     # Check the exact allocation boundary for a synthetic dispatch shape.
-    assert _fit(6400, 237824, maximum_stages=6) == 6
-    assert _fit(6400, 237823, maximum_stages=6) == 5
-    assert _fit(6400, SM100_SMEM_CAPACITY) == 5
-    # Dispatch storage scales with hidden size: six stages launch at H256.
+    assert _fit(6400, 229376, maximum_stages=6) == 6
+    assert _fit(6400, 229375, maximum_stages=6) == 5
+    assert _fit(6400, SM100_SMEM_CAPACITY) == 6
     assert _fit(256, SM100_SMEM_CAPACITY) == 6
 
 
@@ -201,6 +291,7 @@ class _StageFitLaunchHarness:
         )
         smem = cutlass.utils.SmemAllocator()
         smem.allocate(pipelines.shared_storage_type())
+        pipelines.allocate_fc1_store_smem(smem)
         pipelines.allocate_operand_smem(smem)
 
 
@@ -214,6 +305,8 @@ def test_b200_stage_fit_boundary_matches_launch_limit() -> None:
     # The fitted depth launches; one more stage exceeds the per-CTA limit.
     cute.compile(_StageFitLaunchHarness(fitted, 6400), stream)(stream)
     torch.cuda.synchronize()
-    with pytest.raises(Exception, match="(?i)shared memory"):
+    # CuTe 4.6.2 prints the shared-memory diagnostic to stderr but raises
+    # CUDA_ERROR_INVALID_VALUE from the launch wrapper.
+    with pytest.raises(Exception, match="(?i)shared memory|CUDA_ERROR_INVALID_VALUE"):
         cute.compile(_StageFitLaunchHarness(fitted + 1, 6400), stream)(stream)
         torch.cuda.synchronize()

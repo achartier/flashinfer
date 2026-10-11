@@ -11,7 +11,7 @@ from flashinfer.moe_ep.cute_dsl.megamoe.mxfp8_mxfp4.reference import (
     compute_reference,
     decode_e8m0,
     dequantize_mxfp4,
-    interleave_gate_up_32,
+    interleave_gate_up_8,
     quantize_mxfp4,
     quantize_mxfp8,
 )
@@ -29,7 +29,7 @@ def _problem() -> dict[str, torch.Tensor]:
     eye = torch.eye(hidden, dtype=torch.float32)
     canonical_w13[:, :intermediate] = eye
     canonical_w13[:, intermediate:] = eye
-    w13_q, w13_scale = quantize_mxfp4(interleave_gate_up_32(canonical_w13))
+    w13_q, w13_scale = quantize_mxfp4(interleave_gate_up_8(canonical_w13))
 
     w2 = torch.stack((eye, 2.0 * eye))
     w2_q, w2_scale = quantize_mxfp4(w2)

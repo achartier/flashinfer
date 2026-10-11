@@ -1,0 +1,184 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+"""Check every native FC1 TMEM element against an independently written pattern."""
+
+import pytest
+import torch
+
+cutlass = pytest.importorskip("cutlass")
+import cutlass.cute as cute
+import cutlass.pipeline as pipeline
+from cutlass.cute.nvgpu import tcgen05
+from cutlass.cute.runtime import from_dlpack
+from cuda.bindings import driver as cuda
+
+from flashinfer.moe_ep.cute_dsl.megamoe.mxfp8_mxfp4.device_epilogue import (
+    DeviceEpilogueConfig,
+    PersistentMxfp8Mxfp4Epilogue,
+)
+
+from flashinfer.moe_ep.cute_dsl.megamoe.mxfp8_mxfp4.fc1_store import (
+    fc1_store_layout,
+    store_native_e4m3,
+)
+
+
+class _NativeLoadPattern:
+    def __init__(self, tokens, warps):
+        self.tokens = tokens
+        self.warps = warps
+        self.epilogue = PersistentMxfp8Mxfp4Epilogue(
+            DeviceEpilogueConfig(cta_tile_tokens=tokens, epilogue_warps=warps)
+        )
+
+    @cute.jit
+    def __call__(self, output, stream):
+        self.kernel(output).launch(
+            grid=(1, 1, 1), block=(self.warps * 32, 1, 1), stream=stream
+        )
+
+    @cute.kernel
+    def kernel(self, output):
+        tid, _, _ = cute.arch.thread_idx()
+        warp, lane = tid // 32, tid % 32
+        smem = cutlass.utils.SmemAllocator()
+        holding = smem.allocate_tensor(cutlass.Int32, cute.make_layout(1), 4)
+        barrier = pipeline.NamedBarrier(barrier_id=1, num_threads=self.warps * 32)
+        allocator = cutlass.utils.TmemAllocator(
+            holding.iterator, barrier_for_retrieve=barrier, allocator_warp_id=0
+        )
+        allocator.allocate(512)
+        allocator.wait_for_alloc()
+        base = allocator.retrieve_ptr(cutlass.Float32)
+        tensor = cute.make_tensor(base, cute.make_layout(512))
+        if warp < 4:
+            for stage in cutlass.range_constexpr(2):
+                for group in cutlass.range_constexpr(self.tokens // 32):
+                    registers = cute.make_rmem_tensor(
+                        self.epilogue._rmem_layout().shape, cutlass.Float32
+                    )
+                    for token in cutlass.range_constexpr(32):
+                        registers[token] = cutlass.Float32(
+                            (warp * 32 + lane) * 1024
+                            + stage * self.tokens
+                            + group * 32
+                            + token
+                        )
+                    offset = warp * (32 << 16) + stage * self.tokens + group * 32
+                    target = cute.make_tensor(
+                        base + cute.assume(offset, divby=32),
+                        self.epilogue._tmem_layout(),
+                    )
+                    cute.copy(
+                        cute.make_copy_atom(
+                            tcgen05.St32x32bOp(tcgen05.Repetition.x32), cutlass.Float32
+                        ),
+                        registers,
+                        target,
+                    )
+            cute.arch.fence_view_async_tmem_store()
+        barrier.arrive_and_wait()
+        for stage in cutlass.range_constexpr(2):
+            for group in cutlass.range_constexpr(self.tokens // 32):
+                for half in cutlass.range_constexpr(2):
+                    registers = self.epilogue._load_fc1_native_half(
+                        tensor, warp, cutlass.Int32(group), cutlass.Int32(stage), half
+                    )
+                    for register in cutlass.range_constexpr(16):
+                        output[tid, stage, group, half, register] = registers[register]
+        cute.arch.fence_view_async_tmem_load()
+        barrier.arrive_and_wait()
+        allocator.relinquish_alloc_permit()
+        allocator.free(base, 512)
+
+
+@pytest.mark.parametrize("tokens", [64, 128, 192])
+@pytest.mark.parametrize("warps", [4, 8])
+def test_native_fc1_tmem_element_mapping(tokens, warps):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("requires SM100/SM103")
+    output = torch.empty((warps * 32, 2, tokens // 32, 2, 16), device="cuda")
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    view = from_dlpack(output)
+    run = cute.compile(_NativeLoadPattern(tokens, warps), view, stream)
+    run(view, stream)
+    tid, stage, group, half, reg = torch.meshgrid(
+        *[torch.arange(n) for n in output.shape], indexing="ij"
+    )
+    row = (tid // 32 % 4) * 32 + half * 16 + (tid % 32) // 4 + 8 * (reg // 2 % 2)
+    col = stage * tokens + group * 32 + (tid % 4) * 2 + reg % 2 + 8 * (reg // 4)
+    torch.testing.assert_close(output.cpu(), (row * 1024 + col).float(), rtol=0, atol=0)
+
+
+class _NativeStorePattern:
+    def __init__(self, warps, padding):
+        self.warps = warps
+        self.padding = padding
+
+    @cute.jit
+    def __call__(self, output, stream):
+        self.kernel(output).launch(
+            grid=(1, 1, 1), block=(self.warps * 32, 1, 1), stream=stream
+        )
+
+    @cute.kernel
+    def kernel(self, output):
+        tid, _, _ = cute.arch.thread_idx()
+        warp, lane = tid // 32, tid % 32
+        smem = cutlass.utils.SmemAllocator()
+        if cutlass.const_expr(self.padding):
+            smem.allocate_tensor(cutlass.Uint8, cute.make_layout(self.padding), 128)
+        layout = fc1_store_layout(self.warps // 4)
+        staged = smem.allocate_tensor(
+            cutlass.Uint8, layout.outer, byte_alignment=128, swizzle=layout.inner
+        )
+        for buffer in cutlass.range_constexpr(2):
+            stage = staged[None, None, buffer, warp // 4]
+            raw = cute.make_rmem_tensor((16,), cutlass.Uint8)
+            for i in cutlass.range_constexpr(4):
+                token = (lane % 4) * 2 + i * 8
+                feature = (warp % 4) * 16 + lane // 4
+                salt = buffer * 19 + (warp // 4) * 37
+                raw[i * 4] = (token * 7 + feature * 3 + salt).to(cutlass.Uint8)
+                raw[i * 4 + 1] = ((token + 1) * 7 + feature * 3 + salt).to(
+                    cutlass.Uint8
+                )
+                raw[i * 4 + 2] = (token * 7 + (feature + 8) * 3 + salt).to(
+                    cutlass.Uint8
+                )
+                raw[i * 4 + 3] = ((token + 1) * 7 + (feature + 8) * 3 + salt).to(
+                    cutlass.Uint8
+                )
+            regs = cute.recast_tensor(raw, cutlass.Uint32)
+            store_native_e4m3(
+                stage.iterator,
+                cute.crd2idx((lane, (warp % 4) * 16), stage.layout),
+                regs[0],
+                regs[1],
+                regs[2],
+                regs[3],
+            )
+        cute.arch.sync_threads()
+        for buffer in cutlass.range_constexpr(2):
+            for i in cutlass.range_constexpr(16):
+                index = tid % 128 + i * 128
+                output[buffer, warp // 4, index // 64, index % 64] = staged[
+                    index // 64, index % 64, buffer, warp // 4
+                ]
+
+
+@pytest.mark.parametrize("warps", [4, 8])
+@pytest.mark.parametrize("padding", [0, 128, 256, 384])
+def test_native_fc1_stsm_element_mapping(warps, padding):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("requires SM100/SM103")
+    output = torch.empty((2, warps // 4, 32, 64), dtype=torch.uint8, device="cuda")
+    view = from_dlpack(output)
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    run = cute.compile(_NativeStorePattern(warps, padding), view, stream)
+    run(view, stream)
+    buffer, group, token, feature = torch.meshgrid(
+        *[torch.arange(n, device="cuda") for n in output.shape], indexing="ij"
+    )
+    expected = (buffer * 19 + group * 37 + token * 7 + feature * 3).to(torch.uint8)
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)

@@ -131,8 +131,8 @@ def test_device_module_is_standalone_and_exposes_full_persistent_protocol() -> N
 
 
 @pytest.mark.parametrize("lean", [False, True])
-@pytest.mark.parametrize("atomic", [False, True])
-def test_scheduler_params_optional_fields_roundtrip(lean, atomic):
+@pytest.mark.parametrize("mode", ["static", "atomic_counter", "alternating"])
+def test_scheduler_params_optional_fields_roundtrip(lean, mode):
     """Exercise the actual marshaling methods with strict lightweight values.
 
     This runs without CUDA/CuTe installed; the stand-ins reject None so a lost
@@ -196,8 +196,8 @@ def test_scheduler_params_optional_fields_roundtrip(lean, atomic):
         fc2_ready_threshold=4,
         expert_data_row_offsets=Value("data") if lean else None,
         expert_scale_row_offsets=Value("scales") if lean else None,
-        load_balance_mode="atomic_counter" if atomic else "static",
-        load_balance_counter_ptr=Value("claim") if atomic else None,
+        load_balance_mode=mode,
+        load_balance_counter_ptr=Value("claim") if mode != "static" else None,
     )
     values = params.__extract_mlir_values__()
     rebound = params.__new_from_mlir_values__(values)

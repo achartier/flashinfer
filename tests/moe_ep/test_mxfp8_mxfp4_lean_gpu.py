@@ -29,7 +29,7 @@ def _case(counts, scale_alignment, *, hidden=256, intermediate=256):
     )
     from flashinfer.moe_ep.cute_dsl.megamoe.mxfp8_mxfp4.reference import (
         compute_reference,
-        interleave_gate_up_32,
+        interleave_gate_up_8,
         quantize_mxfp4,
         quantize_mxfp8,
     )
@@ -69,7 +69,7 @@ def _case(counts, scale_alignment, *, hidden=256, intermediate=256):
     )
     xq, xs = quantize_mxfp8(random((sum(counts), hidden), 0.5) * magnitudes)
     w13q, w13s = quantize_mxfp4(
-        interleave_gate_up_32(random((experts, 2 * intermediate, hidden), 0.125))
+        interleave_gate_up_8(random((experts, 2 * intermediate, hidden), 0.125))
     )
     w2q, w2s = quantize_mxfp4(random((experts, hidden, intermediate), 0.125))
     ids = torch.repeat_interleave(
@@ -173,8 +173,7 @@ def test_lean_fc12_n64_multi_tile(counts, scale_alignment):
 @pytest.mark.arch_blackwell
 @pytest.mark.parametrize("tile_tokens", [64, 128])
 def test_lean_fc12_legacy_fc1_epilogue(monkeypatch, tile_tokens):
-    # The split FC1 epilogue is the default; keep the original single-warp
-    # path (FLASHINFER_MXFP8_MXFP4_FC1_EPI_LEGACY=1) covered.
+    # Keep the diagnostic register-transpose path covered with gate8/up8 weights.
     _require_blackwell()
     from flashinfer.moe_ep.cute_dsl.megamoe.mxfp8_mxfp4.device_epilogue import (
         FC1_EPI_LEGACY_ENV,
@@ -186,6 +185,92 @@ def test_lean_fc12_legacy_fc1_epilogue(monkeypatch, tile_tokens):
     actual = launcher.run(inputs)
     torch.cuda.synchronize()
     torch.testing.assert_close(actual[rows], expected, atol=0.015, rtol=0.05)
+
+
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize("tile_tokens", [64, 128, 192])
+@pytest.mark.parametrize("warps", [4, 8])
+@pytest.mark.parametrize("fast_math,clamp", [(False, None), (True, 0.5)])
+def test_native_fc1_matches_transpose_bytes(
+    monkeypatch, tile_tokens, warps, fast_math, clamp
+):
+    _require_blackwell()
+    from flashinfer.moe_ep.cute_dsl.megamoe.mxfp8_mxfp4.device_epilogue import (
+        FC1_EPI_LEGACY_ENV,
+    )
+
+    from flashinfer.moe_ep.cute_dsl.megamoe.mxfp8_mxfp4.weight_scale_views import (
+        from_atom_swizzled,
+    )
+
+    # Cross every SF atom sub-row and K-block boundary, full/partial groups,
+    # and N64/N128/N192 tile boundaries with unequal data and scale row bases.
+    counts = (0, 1, 31, 32, 33, 65, 129, 193)
+    saved = []
+    for legacy in ("1", "0"):
+        monkeypatch.setenv(FC1_EPI_LEGACY_ENV, legacy)
+        launcher, inputs, rows, _ = _case(counts, 128, intermediate=640)
+        launcher.tactic.update(
+            mma_tiler_mnk=(128, tile_tokens, 128), epilogue_warps=warps
+        )
+        launcher.gate_up_clamp = clamp
+        launcher.fast_math = fast_math
+        launcher.run(inputs)  # Allocate and compile before seeding guard bytes.
+        launcher._fc1.view(torch.uint8).fill_(0xA5)
+        launcher._fc1_sf.view(torch.uint8).fill_(0xA5)
+        output = launcher.run(inputs)
+        scales = from_atom_swizzled(
+            launcher._fc1_sf.view(torch.uint8).flatten(),
+            rows=launcher._sf_capacity,
+            k_elements=launcher.config.intermediate,
+        )
+        data_padding = torch.ones(
+            launcher._fc1.shape[0], dtype=torch.bool, device="cuda"
+        )
+        data_padding[rows] = False
+        scale_padding = torch.ones(
+            launcher._sf_capacity, dtype=torch.bool, device="cuda"
+        )
+        for start, count in zip(launcher._sf_offsets.tolist(), counts, strict=False):
+            scale_padding[start : start + count] = False
+        assert torch.all(launcher._fc1.view(torch.uint8)[data_padding] == 0xA5)
+        assert torch.all(scales[scale_padding] == 0xA5)
+        saved.append(
+            (
+                output[rows].view(torch.uint8).clone(),
+                launcher._fc1.view(torch.uint8).clone(),
+                launcher._fc1_sf.view(torch.uint8).clone(),
+            )
+        )
+    for before, after in zip(saved[0], saved[1], strict=True):
+        torch.testing.assert_close(before, after, rtol=0, atol=0)
+
+
+@pytest.mark.arch_blackwell
+def test_native_fc1_preserves_amax_zero_seed(monkeypatch):
+    _require_blackwell()
+    from flashinfer.moe_ep.cute_dsl.megamoe.mxfp8_mxfp4.device_epilogue import (
+        FC1_EPI_LEGACY_ENV,
+    )
+    from flashinfer.moe_ep.cute_dsl.megamoe.mxfp8_mxfp4.weight_scale_views import (
+        from_atom_swizzled,
+    )
+
+    saved = []
+    for legacy in ("1", "0"):
+        monkeypatch.setenv(FC1_EPI_LEGACY_ENV, legacy)
+        launcher, inputs, rows, _ = _case((128,), 64)
+        inputs.activation.view(torch.uint8).fill_(0x7F)  # E4M3 NaN
+        launcher.run(inputs)
+        scales = from_atom_swizzled(
+            launcher._fc1_sf.view(torch.uint8).flatten(),
+            rows=launcher._sf_capacity,
+            k_elements=launcher.config.intermediate,
+        )[:128].clone()
+        saved.append((launcher._fc1.view(torch.uint8)[rows].clone(), scales))
+    for before, after in zip(saved[0], saved[1], strict=True):
+        torch.testing.assert_close(before, after, rtol=0, atol=0)
+    assert torch.count_nonzero(saved[1][1]) == 0
 
 
 @pytest.mark.arch_blackwell
@@ -241,3 +326,73 @@ def test_lean_fc12_cuda_graph_replay(scale_alignment):
         torch.cuda.synchronize()
         torch.testing.assert_close(actual[rows], baseline, atol=0, rtol=0)
         torch.testing.assert_close(actual[rows], expected, atol=0.015, rtol=0.05)
+
+
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize("tile_tokens", [64, 128, 192])
+@pytest.mark.parametrize("mma_m", [128, 256])
+@pytest.mark.parametrize("skip", ["none", "fc1", "both"])
+def test_lean_eight_warp_epilogue_is_bit_exact(monkeypatch, tile_tokens, mma_m, skip):
+    """Both warpgroups must drain even when E1 gives one no token groups."""
+    _require_blackwell()
+    monkeypatch.setenv("FLASHINFER_MXFP8_MXFP4_E1_SKIP", skip)
+    baseline = None
+    for warps in (4, 8):
+        monkeypatch.setenv("FLASHINFER_MXFP8_MXFP4_EPILOGUE_WARPS", str(warps))
+        launcher, inputs, rows, expected = _case((1, 33, 65, 193), 64)
+        launcher.tactic["mma_tiler_mnk"] = (mma_m, tile_tokens, 128)
+        launcher.tactic["cluster_shape_mnk"] = (2 if mma_m == 256 else 1, 1, 1)
+        actual = launcher.run(inputs)[rows].clone()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(actual, expected, atol=0.015, rtol=0.05)
+        if baseline is None:
+            baseline = actual
+        else:
+            assert torch.equal(actual, baseline)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            output = launcher.run(inputs)
+        for _ in range(3):
+            inputs.output.fill_(float("nan"))
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.equal(output[rows], baseline)
+
+
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize("tile_tokens", [64, 128, 192])
+@pytest.mark.parametrize("warps", [4, 8])
+@pytest.mark.parametrize("mma_m", [128, 256])
+def test_fc1_tma_store_matches_direct_bytes(monkeypatch, tile_tokens, warps, mma_m):
+    """Exercise ring reuse, partial groups, row offsets and graph publication."""
+    _require_blackwell()
+    monkeypatch.delenv("FLASHINFER_MXFP8_MXFP4_FC1_EPI_LEGACY", raising=False)
+    saved = []
+    for enabled in ("0", "1"):
+        monkeypatch.setenv("FLASHINFER_MXFP8_MXFP4_FC1_TMA_STORE", enabled)
+        launcher, inputs, rows, expected = _case((0, 31, 32, 33, 191, 193, 257), 128)
+        launcher.tactic.update(
+            mma_tiler_mnk=(mma_m, tile_tokens, 128),
+            cluster_shape_mnk=(2 if mma_m == 256 else 1, 1, 1),
+            epilogue_warps=warps,
+        )
+        launcher.run(inputs)  # compile and allocate outside capture
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            launcher._fc1.view(torch.uint8).fill_(0x5A)
+            launcher._fc1_sf.view(torch.uint8).fill_(0x5A)
+            launcher.run(inputs)
+        for _ in range(5):
+            graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(inputs.output[rows], expected, atol=0.015, rtol=0.05)
+        saved.append(
+            (
+                inputs.output[rows].view(torch.uint8).clone(),
+                launcher._fc1.view(torch.uint8).clone(),
+                launcher._fc1_sf.view(torch.uint8).clone(),
+            )
+        )
+    # Includes all padding: a partial TMA box must not overwrite sentinel rows.
+    for direct, staged in zip(saved[0], saved[1], strict=True):
+        torch.testing.assert_close(direct, staged, rtol=0, atol=0)

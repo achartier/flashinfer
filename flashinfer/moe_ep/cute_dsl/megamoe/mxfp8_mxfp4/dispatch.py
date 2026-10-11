@@ -111,6 +111,19 @@ class Mxfp8DispatchPhase:
         self.num_other_warps = num_other_warps
         self.flag_batch = flag_batch
         self._token_comm: Any | None = None
+        self._tail_reduce: Any | None = None
+
+    def bind_in_kernel_reduce(self, route_terms: Any, output: Any) -> None:
+        """Bind device-region operands for the optional all-warp tail reduce."""
+
+        from .fc2_epilogue import InKernelTopKReduction
+
+        self._tail_reduce = InKernelTopKReduction(
+            hidden=self.config.hidden,
+            num_topk=self.config.num_topk,
+            route_terms=route_terms,
+            output=output,
+        )
 
     @property
     def token_comm(self) -> Any:
@@ -246,7 +259,8 @@ class Mxfp8DispatchPhase:
         # Every producer thread orders its peer route stores at system scope
         # before handing completion to the dispatch warps through the CTA
         # rendezvous. Their grid/NVLink release-acquire barriers then make those
-        # stores visible to the source-rank reducer launched after kernel exit.
+        # stores visible to the source-rank reducer, either in the all-warp
+        # tail callback or launched after kernel exit.
         if self.config.world_size > 1:
             import cutlass.cute as cute
 
@@ -257,6 +271,7 @@ class Mxfp8DispatchPhase:
             warp_idx=warp_idx,
             lane_idx=lane_idx,
             tidx=tidx,
+            tail_work=self._tail_reduce,
         )
 
 

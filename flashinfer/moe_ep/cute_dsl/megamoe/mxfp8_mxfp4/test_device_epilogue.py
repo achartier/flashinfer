@@ -11,17 +11,20 @@ cutlass = pytest.importorskip("cutlass")
 
 from flashinfer.moe_ep.cute_dsl.megamoe.mxfp8_mxfp4.device_epilogue import (  # noqa: E402
     DeviceEpilogueConfig,
+    EPILOGUE_WARPS_ENV,
     PersistentMxfp8Mxfp4Epilogue,
+    epilogue_warps_from_env,
     route_metadata_host,
 )
 
 
-def test_device_epilogue_geometry() -> None:
-    config = DeviceEpilogueConfig()
+@pytest.mark.parametrize("warps", [4, 8])
+def test_device_epilogue_geometry(warps) -> None:
+    config = DeviceEpilogueConfig(epilogue_warps=warps)
     assert config.token_groups == 4
     assert config.fc1_output_features_per_tile == 64
-    assert config.fc1_active_warps == 4
-    assert config.fc2_active_warps == 4
+    assert config.fc1_active_warps == warps
+    assert config.fc2_active_warps == warps
     assert config.accumulator_tmem_columns == 256
 
 
@@ -29,9 +32,11 @@ def test_device_epilogue_geometry() -> None:
     ("kwargs", "message"),
     [
         ({"cta_tile_features": 256}, "128-row"),
-        ({"cta_tile_tokens": 48}, "requires N64 or N128"),
+        ({"cta_tile_tokens": 48}, "requires N64, N128, or N192"),
         ({"accumulator_stages": 1}, "exactly two"),
-        ({"epilogue_warps": 8}, "exactly four"),
+        ({"epilogue_warps": 6}, "four or eight"),
+        ({"epilogue_warps": 8, "barrier_id": 3}, "must differ"),
+        ({"epilogue_warps": 8, "barrier_id": 4}, "must differ"),
         ({"gate_up_clamp": -1.0}, "non-negative"),
     ],
 )
@@ -50,6 +55,18 @@ def test_route_metadata_wire_format() -> None:
         source_token,
         source_topk,
     )
+
+
+@pytest.mark.parametrize("value", ["4", "8", " 8 ", "", "0", "6", "eight"])
+def test_epilogue_width_environment(monkeypatch, value) -> None:
+    monkeypatch.delenv(EPILOGUE_WARPS_ENV, raising=False)
+    assert epilogue_warps_from_env() == 4
+    monkeypatch.setenv(EPILOGUE_WARPS_ENV, value)
+    if value.strip() in ("4", "8"):
+        assert epilogue_warps_from_env() == int(value)
+    else:
+        with pytest.raises(ValueError, match=EPILOGUE_WARPS_ENV):
+            epilogue_warps_from_env()
 
 
 def test_device_interface_has_no_routing_score() -> None:
@@ -75,7 +92,7 @@ def test_device_epilogue_reuses_numerical_primitives() -> None:
     source = inspect.getsource(PersistentMxfp8Mxfp4Epilogue)
     assert "Fc1Epilogue" in source
     assert "Fc2Bf16Epilogue" in source
-    assert ".fc1.transform(" in source
+    assert "_clamp_and_swiglu(" in source
     assert ".fc2_subtile.store_rmem_subtile(" in source
 
 

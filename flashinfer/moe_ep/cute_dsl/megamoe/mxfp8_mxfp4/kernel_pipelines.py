@@ -33,11 +33,13 @@ from cutlass.cute.nvgpu import tcgen05
 
 from .device_epilogue import (
     EPILOGUE_WARPS,
+    EXCHANGE_BARRIER_IDS,
     EXCHANGE_WORDS,
     PersistentMxfp8Mxfp4Epilogue,
 )
 from .device_scheduler import DeviceSchedulerParams, PersistentDeviceScheduler
 from .dispatch import Mxfp8DispatchPhase
+from .fc1_store import fc1_store_bytes, fc1_store_layout
 from .scale_tma_staging import Mxfp8Mxfp4TmaStaging
 from .stage_fit import MX_BLOCK_SIZE, OperandStageBytes, StageFit
 
@@ -70,14 +72,35 @@ class KernelWarpIds:
             self.scheduler,
             *self.dispatch,
         )
-        if len(self.epilogue) != EPILOGUE_WARPS:
-            raise ValueError(f"the autonomous epilogue requires {EPILOGUE_WARPS} warps")
+        if len(self.epilogue) not in (4, 8):
+            raise ValueError("the autonomous epilogue requires four or eight warps")
         if len(self.dispatch) not in (0, 4):
             raise ValueError("lean uses zero dispatch warps; mega uses four")
         if min(all_ids) < 0 or len(set(all_ids)) != len(all_ids):
             raise ValueError("kernel warp IDs must be distinct non-negative values")
         if tuple(sorted(all_ids)) != tuple(range(max(all_ids) + 1)):
             raise ValueError("kernel warp IDs must form a dense zero-based range")
+        expected_epilogue: Tuple[int, ...] = (0, 1, 2, 3)
+        if len(self.epilogue) == 8:
+            start = 8 + len(self.dispatch)
+            expected_epilogue += tuple(range(start, start + 4))
+        if (
+            self.epilogue != expected_epilogue
+            or (self.mma, self.tma_a, self.tma_b, self.scheduler) != (4, 5, 6, 7)
+            or self.dispatch not in ((), (8, 9, 10, 11))
+        ):
+            raise ValueError("warp roles must preserve the role-pure warpgroup layout")
+
+    @classmethod
+    def for_epilogue(cls, epilogue_warps: int, *, mega: bool = True) -> "KernelWarpIds":
+        """Append a role-pure epilogue warpgroup after the existing roles."""
+        if epilogue_warps not in (4, 8):
+            raise ValueError("epilogue_warps must be 4 or 8")
+        start = 12 if mega else 8
+        epilogue: Tuple[int, ...] = (0, 1, 2, 3)
+        if epilogue_warps == 8:
+            epilogue += tuple(range(start, start + 4))
+        return cls(epilogue=epilogue, dispatch=(8, 9, 10, 11) if mega else ())
 
     @property
     def threads_per_cta(self) -> int:
@@ -143,16 +166,17 @@ class KernelPipelines:
         tmem_alloc_barrier_id: int = 2,
     ) -> None:
         if warp_ids is None:
-            warp_ids = (
-                KernelWarpIds()
-                if dispatch_phase is not None
-                else KernelWarpIds(dispatch=())
+            warp_ids = KernelWarpIds.for_epilogue(
+                epilogue.config.epilogue_warps, mega=dispatch_phase is not None
             )
+        if len(warp_ids.epilogue) != epilogue.config.epilogue_warps:
+            raise ValueError("epilogue and KernelWarpIds disagree on warp count")
         if (dispatch_phase is None) != (not warp_ids.dispatch):
             raise ValueError("dispatch warp population must match communication mode")
         self.validate_mma_tiler_mn(staging.mma_tiler_mn)
-        if staging.cta_group != tcgen05.CtaGroup.ONE:
-            raise ValueError("persistent bring-up requires one-CTA tcgen05 MMA")
+        self.two_cta = staging.cta_group == tcgen05.CtaGroup.TWO
+        if self.two_cta and tuple(staging.cluster_shape_mn) != (2, 1):
+            raise ValueError("2-CTA MMA requires a (2, 1) cluster")
         if staging.sf_vec_size != 32:
             raise ValueError("MXFP8 x MXFP4 pipelines require block-32 scaling")
         if epilogue.config.cta_tile_features != staging.cta_tile_shape_mnk[0]:
@@ -188,6 +212,11 @@ class KernelPipelines:
             raise ValueError(
                 "TMEM allocation and epilogue boundary barriers must differ"
             )
+        if (
+            len(warp_ids.epilogue) == 8
+            and tmem_alloc_barrier_id in EXCHANGE_BARRIER_IDS
+        ):
+            raise ValueError("TMEM allocation and exchange barriers must differ")
 
         self.staging = staging
         self.scheduler_params = scheduler_params
@@ -211,7 +240,7 @@ class KernelPipelines:
                 "the rounded allocation exceeds the 512-column limit"
             )
 
-        self._shared_storage_type = None
+        self._shared_storage_type: Optional[type] = None
 
     @staticmethod
     def validate_mma_tiler_mn(mma_tiler_mn: Tuple[int, int]) -> None:
@@ -222,8 +251,10 @@ class KernelPipelines:
         than entering CuTe tracing and constructing a two-CTA MMA.
         """
 
-        if len(mma_tiler_mn) != 2 or mma_tiler_mn[0] != 128:
-            raise ValueError("persistent bring-up requires an M128 MMA tile")
+        if len(mma_tiler_mn) != 2 or mma_tiler_mn[0] not in (128, 256):
+            raise ValueError(
+                "persistent kernel requires an M128 (1-CTA) or M256 (2-CTA) MMA tile"
+            )
 
     @property
     def threads_per_cta(self) -> int:
@@ -243,6 +274,7 @@ class KernelPipelines:
                 num_acc_stages=self.num_acc_stages,
                 scheduler_params=self.scheduler_params,
                 dispatch_phase=self.dispatch_phase,
+                epilogue_warps=len(self.warp_ids.epilogue),
             )
         return self._shared_storage_type
 
@@ -253,6 +285,7 @@ class KernelPipelines:
         num_acc_stages: int,
         scheduler_params: Any,
         dispatch_phase: Optional[Mxfp8DispatchPhase],
+        epilogue_warps: int = EPILOGUE_WARPS,
     ) -> type:
         """Compose the control-storage struct for a given operand stage count.
 
@@ -267,6 +300,9 @@ class KernelPipelines:
         )
         num_operand_barriers = num_ab_stages * 2
         num_acc_barriers = num_acc_stages * 2
+        if epilogue_warps not in (4, 8):
+            raise ValueError("epilogue_warps must be 4 or 8")
+        exchange_words = EXCHANGE_WORDS * (epilogue_warps // EPILOGUE_WARPS)
 
         if dispatch_phase is None:
 
@@ -274,8 +310,8 @@ class KernelPipelines:
             class LeanSharedStorage:
                 ab_full_mbar: cute.struct.MemRange[cutlass.Int64, num_operand_barriers]
                 acc_full_mbar: cute.struct.MemRange[cutlass.Int64, num_acc_barriers]
-                scheduler: SchedulerStorage
-                epilogue_exchange: cute.struct.MemRange[cutlass.Float32, EXCHANGE_WORDS]
+                scheduler: SchedulerStorage  # type: ignore[valid-type]
+                epilogue_exchange: cute.struct.MemRange[cutlass.Float32, exchange_words]
                 tmem_dealloc_mbar: cutlass.Int64
                 tmem_holding_buf: cutlass.Int32
 
@@ -287,13 +323,25 @@ class KernelPipelines:
         class SharedStorage:
             ab_full_mbar: cute.struct.MemRange[cutlass.Int64, num_operand_barriers]
             acc_full_mbar: cute.struct.MemRange[cutlass.Int64, num_acc_barriers]
-            scheduler: SchedulerStorage
-            dispatch: DispatchStorage
-            epilogue_exchange: cute.struct.MemRange[cutlass.Float32, EXCHANGE_WORDS]
+            scheduler: SchedulerStorage  # type: ignore[valid-type]
+            dispatch: DispatchStorage  # type: ignore[valid-type]
+            epilogue_exchange: cute.struct.MemRange[cutlass.Float32, exchange_words]
             tmem_dealloc_mbar: cutlass.Int64
             tmem_holding_buf: cutlass.Int32
 
         return SharedStorage
+
+    def allocate_fc1_store_smem(self, smem):
+        """Allocate the store ring before operands, matching the host stage fit."""
+        if not self.epilogue.fc1_tma_store:
+            return None
+        layout = fc1_store_layout(len(self.warp_ids.epilogue) // 4)
+        return smem.allocate_tensor(
+            cutlass.Float8E4M3FN,
+            layout.outer,
+            byte_alignment=128,
+            swizzle=layout.inner,
+        )
 
     def allocate_operand_smem(self, smem) -> OperandSmem:
         """Allocate A/B/SFA/SFB stage tensors with their authoritative layouts."""
@@ -345,8 +393,11 @@ class KernelPipelines:
             barrier_storage=storage.acc_full_mbar.data_ptr(),
             num_stages=self.num_acc_stages,
             producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
+            # With a 2-CTA MMA both CTAs' epilogue warps release the leader's
+            # accumulator stage.
             consumer_group=pipeline.CooperativeGroup(
-                pipeline.Agent.Thread, len(self.warp_ids.epilogue) * WARP_SIZE
+                pipeline.Agent.Thread,
+                len(self.warp_ids.epilogue) * WARP_SIZE * (2 if self.two_cta else 1),
             ),
             cta_layout_vmnk=self.staging.cluster_layout_vmnk,
             defer_sync=True,
@@ -376,7 +427,7 @@ class KernelPipelines:
         return SchedulerBundle(scheduler, scheduler.make_consumer())
 
     def make_tmem_allocator(self, storage):
-        """Build the one-CTA TMEM allocator shared by MMA and epilogue warps."""
+        """Build the TMEM allocator shared by MMA and epilogue warps."""
 
         alloc_barrier = pipeline.NamedBarrier(
             barrier_id=self.tmem_alloc_barrier_id,
@@ -386,7 +437,7 @@ class KernelPipelines:
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=alloc_barrier,
             allocator_warp_id=self.warp_ids.epilogue[0],
-            is_two_cta=False,
+            is_two_cta=self.two_cta,
             two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar.ptr,
         )
 
@@ -440,7 +491,7 @@ _OPERAND_SMEM_ALIGNMENT = 128
 
 
 def mma_operand_stage_bytes(mma_tiler_mnk: Tuple[int, int, int]) -> OperandStageBytes:
-    """Shared-memory bytes of one A/B/SFA/SFB stage for the native M128 tile.
+    """Per-CTA shared-memory bytes of one A/B/SFA/SFB stage.
 
     FP4 weights occupy 8-bit shared-memory containers for the mixed-kind MMA,
     activations are FP8, and each operand carries one E8M0 byte per 32 K
@@ -449,10 +500,14 @@ def mma_operand_stage_bytes(mma_tiler_mnk: Tuple[int, int, int]) -> OperandStage
     """
 
     m, n, k = mma_tiler_mnk
+    # A 2-CTA (M256) MMA splits both operands across the pair: each CTA
+    # stages its own 128 weight rows and half of the token tile.  SFB is
+    # staged whole in each CTA (1-CTA SFB view).
+    cta_m, cta_n = (m // 2, n // 2) if m == 256 else (m, n)
     return OperandStageBytes(
-        weight_a=m * k,
-        activation_b=n * k,
-        weight_sfa=m * (k // MX_BLOCK_SIZE),
+        weight_a=cta_m * k,
+        activation_b=cta_n * k,
+        weight_sfa=cta_m * (k // MX_BLOCK_SIZE),
         # SFB is staged in whole 128-row atoms even for N64 tiles.
         activation_sfb=(n + 127) // 128 * 128 * (k // MX_BLOCK_SIZE),
     )
@@ -467,6 +522,7 @@ def fit_operand_stages(
     num_acc_stages: int = 2,
     minimum_stages: int = 2,
     maximum_stages: int = 8,
+    epilogue_warps: int = EPILOGUE_WARPS,
 ) -> StageFit:
     """Deepest operand pipeline whose dynamic shared memory fits one CTA.
 
@@ -480,10 +536,12 @@ def fit_operand_stages(
             num_acc_stages=num_acc_stages,
             scheduler_params=scheduler_params,
             dispatch_phase=dispatch_phase,
+            epilogue_warps=epilogue_warps,
         )
         fixed = -(-storage.__sizeof__() // _OPERAND_SMEM_ALIGNMENT) * (
             _OPERAND_SMEM_ALIGNMENT
         )
+        fixed += fc1_store_bytes(epilogue_warps)
         if fixed + stages * operand.total <= smem_capacity_bytes:
             return StageFit(
                 stages=stages,

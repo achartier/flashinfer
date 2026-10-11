@@ -26,7 +26,7 @@ StaticTileClaimer = _SCHEDULER.StaticTileClaimer
 WorkRecord = _SCHEDULER.WorkRecord
 
 
-def _config(**overrides) -> SchedulerConfig:
+def _config(**overrides):
     values = dict(
         expert_token_counts=(17, 0, 33),
         gate_up_size=256,
@@ -222,3 +222,94 @@ def test_explicit_rows_match_mega_when_padding_matches():
 def test_explicit_row_validation(data, scales):
     with pytest.raises(ValueError):
         _config(expert_data_row_offsets=data, expert_scale_row_offsets=scales)
+
+
+@pytest.mark.parametrize("seed", range(20))
+@pytest.mark.parametrize("features", [(52, 16), (1, 8), (8, 1), (1, 1)])
+@pytest.mark.parametrize("counts", [(0, 0), (1,), (0, 17, 0, 257, 1, 0)])
+def test_alternating_random_cluster_durations(seed, features, counts):
+    import random
+
+    rng = random.Random(seed)
+    clusters = rng.choice([1, 2, 3, 8, 74])
+    config = _config(
+        expert_token_counts=counts,
+        gate_up_size=128 * features[0],
+        hidden_size=128 * features[1],
+        num_persistent_clusters=clusters,
+    )
+    scheduler = PersistentFc1Fc2Scheduler(config)
+    fc1, fc2 = AtomicTileClaimer(), AtomicTileClaimer()
+    claimers = [
+        _SCHEDULER.AlternatingTileClaimer(config, fc1, fc2) for _ in range(clusters)
+    ]
+    active = set(range(clusters))
+    ready_at = [0.0] * clusters
+    seen = set()
+    completed_fc1 = set()
+    inflight = {}
+    now = 0.0
+    iterations = 0
+    while active:
+        runnable = [c for c in active if ready_at[c] <= now]
+        rng.shuffle(runnable)
+        progressed = False
+        for c in runnable:
+            if c in inflight:
+                record = inflight[c]
+                key = (record.counter_slot, record.tile_m_idx)
+                if record.phase == Phase.FC1:
+                    completed_fc1.add(key)
+                else:
+                    required = {
+                        (record.counter_slot, f * 2) for f in range(features[0])
+                    }
+                    if not required <= completed_fc1:
+                        continue
+                del inflight[c]
+                progressed = True
+            claim = claimers[c].claim()
+            if claim is None:
+                continue
+            progressed = True
+            record = scheduler.record_for_alternating(claim)
+            if not record.is_valid:
+                active.remove(c)
+                continue
+            key = record.to_words()
+            assert key not in seen
+            seen.add(key)
+            if record.phase == Phase.FC2:
+                assert fc1.value >= (record.counter_slot + 1) * features[0]
+            # FC1 durations are deliberately skewed across clusters.
+            ready_at[c] = now + rng.uniform(0.1, 100 if c % 3 == 0 else 3)
+            inflight[c] = record
+        future = [ready_at[c] for c in active if ready_at[c] > now]
+        if future:
+            now = min(future)
+        else:
+            assert progressed or not active, "all clusters deadlocked"
+        iterations += 1
+        assert iterations < 100000
+    expected = {
+        scheduler.record_for(i).to_words() for i in range(scheduler.cluster_tile_count)
+    }
+    assert seen == expected
+
+
+def test_alternating_fixed_claim_decode_ignores_groups():
+    scheduler = PersistentFc1Fc2Scheduler(_config())
+    # A signed FC2 index is phase-local even though the static order has
+    # multiple groups. Decode every CTA, including the clipped token tail.
+    for phase in [Phase.FC1, Phase.FC2]:
+        expected = [
+            scheduler.record_for(i)
+            for i in range(scheduler.cluster_tile_count)
+            if scheduler.record_for(i).phase == phase
+        ]
+        for index, record in enumerate(expected):
+            claim = index if phase == Phase.FC1 else -index - 1
+            assert scheduler.record_for_alternating(claim) == record
+            peer = scheduler.record_for_alternating(claim, cta_coord_mn=(0, 1))
+            assert peer.tile_m_idx == record.tile_m_idx + 1
+            assert peer.counter_slot == record.counter_slot

@@ -83,7 +83,7 @@ def main():
     )
     from flashinfer.moe_ep.cute_dsl.megamoe.mxfp8_mxfp4.reference import (
         compute_reference,
-        interleave_gate_up_32,
+        interleave_gate_up_8,
         quantize_mxfp4,
         quantize_mxfp8,
     )
@@ -125,7 +125,7 @@ def main():
 
     xq, xs = quantize_mxfp8(random((world, tokens, hidden)))
     w13q, w13s = quantize_weights(
-        interleave_gate_up_32(random((experts, 2 * intermediate, hidden)))
+        interleave_gate_up_8(random((experts, 2 * intermediate, hidden)))
     )
     w2q, w2s = quantize_weights(random((experts, hidden, intermediate)))
     # Both routes visit a remote owner. Adjacent slots go to distinct experts;

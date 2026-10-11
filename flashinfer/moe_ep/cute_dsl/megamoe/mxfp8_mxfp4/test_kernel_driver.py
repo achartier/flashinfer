@@ -39,18 +39,28 @@ def _fake_pipelines(**overrides):
     return SimpleNamespace(**values)
 
 
-def test_driver_freezes_m128_single_cta_contract() -> None:
+def test_driver_accepts_m128_one_cta_and_m256_two_cta() -> None:
     driver = PersistentM128DeviceDriver(kernel_pipelines=_fake_pipelines())
     assert driver.warp_ids.threads_per_cta == 384
+    assert not driver.two_cta
 
-    bad_staging = SimpleNamespace(
+    pair = SimpleNamespace(
         mma_tiler_mn=(256, 128),
         cta_group=tcgen05.CtaGroup.TWO,
         cta_tile_shape_mnk=(128, 128, 128),
     )
-    with pytest.raises(ValueError, match="MMA M=128"):
+    assert PersistentM128DeviceDriver(
+        kernel_pipelines=_fake_pipelines(staging=pair)
+    ).two_cta
+
+    one_cta_m256 = SimpleNamespace(
+        mma_tiler_mn=(256, 128),
+        cta_group=tcgen05.CtaGroup.ONE,
+        cta_tile_shape_mnk=(256, 128, 128),
+    )
+    with pytest.raises(ValueError, match="MMA M must be"):
         PersistentM128DeviceDriver(
-            kernel_pipelines=_fake_pipelines(staging=bad_staging)
+            kernel_pipelines=_fake_pipelines(staging=one_cta_m256)
         )
 
     distributed = SimpleNamespace(config=SimpleNamespace(world_size=2))
@@ -70,10 +80,21 @@ def test_driver_owns_every_persistent_role_and_tail() -> None:
     assert "pipeline_init_wait(" in source
 
 
+@pytest.mark.parametrize("mega", [False, True])
+def test_eight_warp_register_budget(mega) -> None:
+    pipes = _fake_pipelines(warp_ids=KernelWarpIds.for_epilogue(8, mega=mega))
+    driver = PersistentM128DeviceDriver(kernel_pipelines=pipes)
+    assert driver.epilogue_registers == 184
+    assert driver.task_registers == 72
+    with pytest.raises(ValueError, match="register file"):
+        PersistentM128DeviceDriver(kernel_pipelines=pipes, epilogue_registers=256)
+
+
 def test_driver_wires_native_mma_and_readiness_protocols() -> None:
     source = inspect.getsource(PersistentM128DeviceDriver)
+    # Dynamic-N issue is the default; the static full-N path stays for A/B.
+    assert "issue_dynamic_block_scaled_mma_tile(" in source
     assert "cute.gemm(" in source
-    assert "issue_dynamic_block_scaled_mma_tile(" not in source
     assert "work.peek_ready" in source
     assert "fc1_ready_counter_ptr" in source
     assert "fc1_done_counter_ptr" in source
