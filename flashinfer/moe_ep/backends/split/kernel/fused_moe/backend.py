@@ -176,7 +176,7 @@ class FusedMoeSplitKernelBackend(SplitKernelBackend):
         else:
             act_pack = build_activation_pack(
                 expert_tensors,
-                expert_counts=ctx.expert_counts if self._mask_padding else None,
+                expert_counts=ctx.recv_count if self._mask_padding else None,
                 local_expert_offset=offset,
                 quant=quant,
                 per_token_activation=per_token_activation,

@@ -41,6 +41,22 @@ def prepare_megamoe_fc12_weights(
             f"{tuple(w2_bf16.shape)}."
         )
     pair = quant.pair
+    if pair == (QuantFormat.MXFP4, QuantFormat.MXFP8):
+        from ..moe_ep.backends.mega.kernel.sm100.mxfp8_mxfp4_bf16_cutedsl.weights import (
+            preprocess_mega_weights,
+        )
+
+        fc1, fc2 = preprocess_mega_weights(
+            SimpleNamespace(w13=w1_bf16, w2=w2_bf16),
+            intermediate_size=intermediate_size,
+            hidden_size=hidden_size,
+        )
+        return {
+            "fc1_weight": fc1[0],
+            "fc1_weight_sf": fc1[1],
+            "fc2_weight": fc2[0],
+            "fc2_weight_sf": fc2[1],
+        }
     if pair == (QuantFormat.MXFP8, QuantFormat.BF16):
         # Keep the architecture-specific quantizer at the kernel boundary.
         # Its output already has the FC12 K-major data and scale layouts.
@@ -342,3 +358,103 @@ class Bf16Mxfp8Fc12Launcher(Bf16Fc12Launcher):
         self._fc1_output = fc1_output
         self._fc1_done_counter = fc1_done_counter
         self._unit_scores = unit_scores
+
+
+@dataclass
+class Mxfp8Mxfp4Fc12Inputs:
+    activation: torch.Tensor
+    fc1_weight: torch.Tensor
+    fc2_weight: torch.Tensor
+    output: torch.Tensor
+    expert_token_sizes: torch.Tensor
+    fc1_weight_sf: torch.Tensor
+    fc2_weight_sf: torch.Tensor
+    activation_scales: torch.Tensor
+
+
+class Mxfp8Mxfp4Fc12Launcher:
+    """Adapt the communication-free mixed-format core to sorted FC12 rows."""
+
+    def __init__(self, num_experts: int, max_rows: int, hidden: int, intermediate: int):
+        from ..moe_ep.cute_dsl.megamoe.mxfp8_mxfp4.lean_abi import LeanFc12Config
+
+        self.config = LeanFc12Config(
+            local_num_experts=num_experts,
+            hidden=hidden,
+            intermediate=intermediate,
+            data_row_capacity=max_rows,
+            scale_row_capacity=max_rows,
+            data_row_alignment=64,
+            scale_row_alignment=64,
+        )
+        self._launcher = None
+
+    def run(self, inputs: Mxfp8Mxfp4Fc12Inputs) -> None:
+        from ..moe_ep.cute_dsl.megamoe.mxfp8_mxfp4.lean_abi import LeanFc12Inputs
+        from ..moe_ep.cute_dsl.megamoe.mxfp8_mxfp4.lean_kernel import LeanFc12Launcher
+
+        if self._launcher is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "MXFP8 x MXFP4 FC12 must be warmed up before capture"
+                )
+            self._launcher = LeanFc12Launcher(self.config)
+        counts = inputs.expert_token_sizes
+        # moe_sort pads each expert to 64 rows. Keep the prefix on device so
+        # count changes during graph replay do not require a host read.
+        offsets = torch.cat(
+            (
+                counts.new_zeros(1),
+                torch.cumsum(((counts + 63) // 64) * 64, 0, dtype=torch.int32),
+            )
+        )
+        self._launcher.run(
+            LeanFc12Inputs(
+                activation=inputs.activation,
+                activation_scales=inputs.activation_scales,
+                fc1_weight=inputs.fc1_weight,
+                fc1_weight_scales=inputs.fc1_weight_sf,
+                fc2_weight=inputs.fc2_weight,
+                fc2_weight_scales=inputs.fc2_weight_sf,
+                output=inputs.output,
+                expert_token_sizes=counts,
+                expert_data_row_offsets=offsets,
+                expert_scale_row_offsets=offsets,
+            )
+        )
+
+
+def unpermute_mxfp8_mxfp4_routes(
+    terms: torch.Tensor,
+    output: torch.Tensor,
+    expanded_to_permuted: torch.Tensor,
+    weights: torch.Tensor,
+) -> None:
+    """Accumulate rounded BF16 route terms in FP32, in top-k slot order."""
+    num_tokens, top_k = weights.shape
+    mapping = expanded_to_permuted.reshape(-1)[: num_tokens * top_k].reshape(
+        num_tokens, top_k
+    )
+    result = torch.zeros_like(output, dtype=torch.float32)
+    for slot in range(top_k):
+        rows = mapping[:, slot]
+        term = terms.index_select(0, rows.clamp(min=0).long()).float()
+        term = torch.where((rows >= 0).unsqueeze(1), term, 0.0)
+        score = torch.where(rows >= 0, weights[:, slot].float(), 0.0)
+        result.add_(term * score.unsqueeze(1))
+    output.copy_(result)
+
+
+def mxfp8_mxfp4_expert_counts(
+    topk_ids: torch.Tensor, local_expert_offset: int, num_local_experts: int
+) -> torch.Tensor:
+    """Count local assignments on device when moe_sort does not publish counts."""
+    local_ids = topk_ids.reshape(-1) - local_expert_offset
+    valid = (local_ids >= 0) & (local_ids < num_local_experts)
+    counts = torch.zeros(num_local_experts, dtype=torch.int32, device=topk_ids.device)
+    counts.scatter_add_(
+        0,
+        local_ids.clamp(min=0, max=num_local_experts - 1).long(),
+        valid.to(torch.int32),
+    )
+    return counts

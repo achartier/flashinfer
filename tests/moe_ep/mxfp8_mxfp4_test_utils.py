@@ -82,13 +82,13 @@ def _independent_refcheck(
         coordinates = (ids == int(global_expert)).nonzero(as_tuple=False)
         owner_rank, slot = coordinates.unbind(dim=1)
 
-        interleaved = reference.interleave_gate_up_32(w13[local_expert])
+        interleaved = reference.interleave_gate_up_8(w13[local_expert])
         q13, sf13 = _quantize_mxfp4_rows(torch, reference, interleaved)
         w13_fp32 = reference.dequantize_mxfp4(q13, sf13)
         fc1 = x_fp32[owner_rank] @ w13_fp32.transpose(0, 1)
         del interleaved, q13, sf13, w13_fp32
 
-        paired = fc1.reshape(fc1.shape[0], -1, 2, 32)
+        paired = fc1.reshape(fc1.shape[0], -1, 2, 8)
         gate, up = paired[:, :, 0, :], paired[:, :, 1, :]
         if gate_up_clamp is not None:
             limit = abs(float(gate_up_clamp))

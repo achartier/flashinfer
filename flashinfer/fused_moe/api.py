@@ -570,7 +570,7 @@ _CUDNN_GROUPED_GEMM_MXFP8_ARCHS = (100, 103, 107, 110, 120, 121)
 _CUDNN_GROUPED_GEMM_FP4_ARCHS = (100, 103, 107, 110, 120, 121)
 # Standalone FC1/SwiGLU/FC2 MegaMOE kernels.  Each runner additionally
 # validates the precision-family-specific architecture contract.
-_MEGAMOE_FC12_ARCHS = (90, 100, 103, 107, 120, 121)
+_MEGAMOE_FC12_ARCHS = (100, 103)
 
 
 # Default MMA pair shared by the FP4 ``prepare_*`` helpers
@@ -2233,52 +2233,6 @@ class CutlassHummingConfig:
 
 
 @dataclass(frozen=True)
-class MegaMoeFc12Config:
-    """CuTe-DSL MegaMOE FC1/SwiGLU/FC2 compute backend.
-
-    This is a local compute backend: routing, permutation, and output
-    finalization are provided by the unified fused-MoE runner contract.  It
-    therefore works both directly and through the split EP bridge.
-
-    Supports MXFP4 weights with MXFP8 activations, preserving unweighted BF16
-    route terms before deterministic FP32 top-k finalization.
-    """
-
-    @classmethod
-    def supported(cls, arch: int) -> bool:
-        return arch in (100, 103)
-
-    @staticmethod
-    def prepare_weights(
-        w1_bf16,
-        w2_bf16,
-        *,
-        quant: QuantConfig,
-        num_local_experts: int,
-        hidden_size: int,
-        intermediate_size: int,
-        activation: Optional[ActivationConfig] = None,
-        device=None,
-    ):
-        """Build the ``megamoe_fc12`` native view from canonical weights."""
-        from .megamoe_fc12 import prepare_megamoe_fc12_weights
-
-        return prepare_megamoe_fc12_weights(
-            w1_bf16,
-            w2_bf16,
-            quant=quant,
-            num_local_experts=num_local_experts,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            activation=activation,
-            device=device,
-        )
-
-    def __repr__(self) -> str:
-        return "MegaMoeFc12Config()"
-
-
-@dataclass(frozen=True)
 class CuteDslConfig:
     """CuteDSL FP4 backend for W4A4, W4A8, and W4A16.
 
@@ -2438,7 +2392,8 @@ class MegaMoeFc12Config:
 
     This is a local compute backend: routing, permutation, and output
     finalization are provided by the unified fused-MoE runner contract.  It
-    therefore works both directly and through the split EP bridge.
+    therefore works both directly and through the split EP bridge. Supports
+    BF16, BF16/MXFP8, and MXFP8/MXFP4 with unweighted BF16 route terms.
     """
 
     @classmethod
@@ -2679,7 +2634,6 @@ BackendConfigType = Union[
     SM12xFp8Config,
     SM12xMxfp8Mxfp4Config,
     SM12xNvfp4Bf16Config,
-    MegaMoeFc12Config,
     B12xNvfp4Config,
     B12xW4A16Config,
 ]
@@ -2724,7 +2678,6 @@ ALL_BACKEND_CONFIGS = (
     SM12xFp8Config,
     SM12xMxfp8Mxfp4Config,
     SM12xNvfp4Bf16Config,
-    MegaMoeFc12Config,
     B12xNvfp4Config,
     B12xW4A16Config,
 )

@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from .....weights import MoEWeightPack
+from .....weights import MoEWeightPack, PrequantizedMoEWeights
 
 if TYPE_CHECKING:
     from ......fused_moe.api import MoEConfig, MoEWeightPack as FusedMoEWeightPack
@@ -136,17 +136,37 @@ def materialize_fused_moe_weights(
         if quant.pair in (
             (QuantFormat.BF16, QuantFormat.BF16),
             (QuantFormat.MXFP8, QuantFormat.BF16),
+            (QuantFormat.MXFP4, QuantFormat.MXFP8),
         ) and isinstance(backend_cfg, MegaMoeFc12Config):
-            view = MegaMoeFc12Config.prepare_weights(
-                weights.w13,
-                weights.w2,
-                quant=quant,
-                num_local_experts=num_local,
-                hidden_size=hidden,
-                intermediate_size=intermediate,
-                activation=moe_config.activation,
-                device=weights.w13.device,
-            )
+            if quant.pair == (QuantFormat.MXFP4, QuantFormat.MXFP8) and isinstance(
+                weights, PrequantizedMoEWeights
+            ):
+                from flashinfer.moe_ep.backends.mega.kernel.sm100.mxfp8_mxfp4_bf16_cutedsl.weights import (
+                    preprocess_mega_weights,
+                )
+
+                fc1, fc2 = preprocess_mega_weights(
+                    weights,
+                    intermediate_size=intermediate,
+                    hidden_size=hidden * 2,
+                )
+                view = {
+                    "fc1_weight": fc1[0],
+                    "fc1_weight_sf": fc1[1],
+                    "fc2_weight": fc2[0],
+                    "fc2_weight_sf": fc2[1],
+                }
+            else:
+                view = MegaMoeFc12Config.prepare_weights(
+                    weights.w13,
+                    weights.w2,
+                    quant=quant,
+                    num_local_experts=num_local,
+                    hidden_size=hidden,
+                    intermediate_size=intermediate,
+                    activation=moe_config.activation,
+                    device=weights.w13.device,
+                )
             pack.prepare_for("megamoe_fc12", view)
 
     if not pack.native_views:
