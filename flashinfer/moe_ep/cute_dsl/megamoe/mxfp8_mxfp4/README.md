@@ -39,7 +39,25 @@ workspace only after outstanding GPU work completes, collectively for EP.
 
 ## Selecting a tactic
 
-Set `knobs` on `Sm100_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig`:
+The defaults below cover the backend configuration, all 16 tactic fields,
+kernel environment switches, the integration helpers, and every offline CLI
+option. General FlashInfer build/logging controls are described in the
+[repository environment reference](../../../../../CLAUDE.md#environment-variables).
+Defaults assume no environment overrides and no matching persistent cache entry.
+
+`Sm100_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig` has these fields:
+
+| Field | Default | Meaning |
+|---|---|---|
+| `intermediate_size` | Required; no default | Post-SwiGLU width, a positive multiple of 128. |
+| `top_k` | Required; no default | Routes per token, in `[1, 32]`. |
+| `kernel_name` | `"sm100_mxfp8_mxfp4_bf16_cutedsl"` | Fixed backend name. |
+| `quant` | MXFP4 weights, MXFP8 activations, BF16 output; `swizzled_scale_factors=True`, `per_token_scale=False` | Block-scaled quantization contract described above. |
+| `gate_up_clamp` | `None` | No clamp. A supplied value must be finite and positive. |
+| `fast_math` | `True` | Use approximate math in the SwiGLU epilogue. |
+| `knobs` | `None` | Resolve through the persistent cache, then the default tactic. |
+
+The `knobs` choices are:
 
 | Value | Behavior |
 |---|---|
@@ -78,24 +96,27 @@ routing and live token counts to replace these heuristics.
 
 ### Tactic dictionary reference
 
-| Knob | Values and effect |
-|---|---|
-| `mma_tiler_mnk` | `(M, N, K)`; M128 or M256, N64/N128/N192. M is output features, N is routed tokens. The host schema accepts positive K multiples of 32; use K128 for the current device implementation. N256 is unsupported. |
-| `cluster_shape_mnk` | M256 requires `(2, 1, 1)`. The host schema allows cluster axes 1/2/4, a final axis of 1, and at most 16 CTAs; device assembly enforces additional layout constraints. Start with the shipped single-CTA or paired-CTA configurations. Pinning M without a cluster automatically selects the matching cluster. |
-| `num_stages` | `"auto"` or 2–8. Auto fits the deepest operand ring into shared memory, accounting for dispatch, epilogues, and optional stores. Auto can select up to 12 stages for pairs or 8 for single-CTA tiles; a pinned value still must fit. |
-| `group_hint` | Positive integer or `None`. Controls expert grouping in the static work order; smaller groups can expose FC2 earlier. Alternating claims ignore it. |
-| `flag_batch` | 1–32. Number of dispatched arrivals batched before publishing readiness. |
-| `load_balance_mode` | `static`: fixed tile assignment; `atomic_counter`: dynamic claims over the same linear order; `alternating`: independent FC1/FC2 counters with FC1 warmup and dependency-aware FC2 claims. |
-| `token_back_mode` | `epi_warps` sends FC2 rows from epilogue warps; `reuse_dispatch_warps` stages local rows and reuses dispatch warps for return. Both retain deterministic reduction. `standalone_warps` is unsupported. |
-| `token_back_schedule_mode` | `static` or `atomic_counter`; affects return claims only with `reuse_dispatch_warps`. |
-| `epilogue_warps` | 4 or 8. Eight splits token groups across two warpgroups, increasing threads and shared storage and potentially reducing operand stages. |
-| `in_kernel_reduce` | Boolean. Reduce top-k in the persistent kernel tail instead of launching the standalone reducer. Mega only; reduction order is unchanged. |
-| `fc2_store_mode` | `direct`: register transpose; `staged64`: warp-local shared transpose and 64-byte row segments; `staged256`: warpgroup shared transpose and 256-byte segments. Staged modes alias FC1 exchange storage and participate in stage fitting. |
-| `dispatch_dedup` | Boolean, default `False`. Fetch each source token once per owner rank and fan out unchanged activation/scale bytes to local routes. Route metadata and arrivals remain independent. Mega only. |
-| `startup_prefetch_waves` | Integer 0–3, default 0. Prefetch an FC1 weight/scale prefix during startup. Whole waves are capped at 80% of L2 and one pass over unique tiles. Requires single-CTA or M256 pair geometry; Mega only. |
-| `vector_count_publish` | Boolean, default `False`. Publish adjacent expert counts with 16-byte stores when experts per rank is even; retain scalar stores otherwise. |
-| `cta_local_counts` | Boolean, default `False`. Each CTA acquires startup signals and computes owner counts into reusable shared scratch, removing the closing startup grid rendezvous. CTA 0 retains a global diagnostic copy. |
-| `overlap_dispatch_pull` | Boolean, default `False`. Select the next route during a row load and overlap completion of the preceding pool store with the next load. Arrival publication still follows store completion. Cannot be combined with `dispatch_dedup`. |
+Here, capacity means allocated tokens per rank. Pair eligibility is defined
+in the default policy above; single-CTA tiles are used otherwise.
+
+| Knob | Default | Values and effect |
+|---|---|---|
+| `mma_tiler_mnk` | `(M, N, 128)`; M256 for pairs, M128 otherwise; N from the capacity table | M128 or M256, N64/N128/N192. M is output features, N is routed tokens. The host schema accepts positive K multiples of 32; use K128 for the current device implementation. N256 is unsupported. |
+| `cluster_shape_mnk` | `(2, 1, 1)` for pairs; `(1, 1, 1)` otherwise | M256 requires `(2, 1, 1)`. The host schema allows cluster axes 1/2/4, a final axis of 1, and at most 16 CTAs; device assembly enforces additional layout constraints. Pinning M without a cluster automatically selects the matching cluster. |
+| `num_stages` | `"auto"` | `"auto"` or 2–8. Auto fits the deepest operand ring into shared memory, accounting for dispatch, epilogues, and optional stores. Auto can select up to 12 stages for pairs or 8 for single-CTA tiles; a pinned value still must fit. |
+| `group_hint` | 4096 below capacity 512; 512 otherwise | Positive integer or `None`. Controls expert grouping in the static work order; smaller groups can expose FC2 earlier. Alternating claims ignore it. |
+| `flag_batch` | 2 | 1–32. Number of dispatched arrivals batched before publishing readiness. |
+| `load_balance_mode` | Pairs: capacity table; single CTA: `"static"` | `static`: fixed tile assignment; `atomic_counter`: dynamic claims over the same linear order; `alternating`: independent FC1/FC2 counters with FC1 warmup and dependency-aware FC2 claims. |
+| `token_back_mode` | `"epi_warps"` | `epi_warps` sends FC2 rows from epilogue warps; `reuse_dispatch_warps` stages local rows and reuses dispatch warps for return. Both retain deterministic reduction. `standalone_warps` is unsupported. |
+| `token_back_schedule_mode` | `"static"` | `static` or `atomic_counter`; affects return claims only with `reuse_dispatch_warps`. |
+| `epilogue_warps` | 8 for pairs at capacity 256 or above; 4 otherwise | 4 or 8. Eight splits token groups across two warpgroups, increasing threads and shared storage and potentially reducing operand stages. |
+| `in_kernel_reduce` | `True` below capacity 256; `False` otherwise | Boolean. Reduce top-k in the persistent kernel tail instead of launching the standalone reducer. Mega only; reduction order is unchanged. |
+| `fc2_store_mode` | `"staged256"` | `direct`: register transpose; `staged64`: warp-local shared transpose and 64-byte row segments; `staged256`: warpgroup shared transpose and 256-byte segments. Staged modes alias FC1 exchange storage and participate in stage fitting. |
+| `dispatch_dedup` | `False` | Boolean. Fetch each source token once per owner rank and fan out unchanged activation/scale bytes to local routes. Route metadata and arrivals remain independent. Mega only. |
+| `startup_prefetch_waves` | 0 | Integer 0–3. Prefetch an FC1 weight/scale prefix during startup. Whole waves are capped at 80% of L2 and one pass over unique tiles. Requires single-CTA or M256 pair geometry; Mega only. |
+| `vector_count_publish` | `False` | Boolean. Publish adjacent expert counts with 16-byte stores when experts per rank is even; retain scalar stores otherwise. |
+| `cta_local_counts` | `False` | Boolean. Each CTA acquires startup signals and computes owner counts into reusable shared scratch, removing the closing startup grid rendezvous. CTA 0 retains a global diagnostic copy. |
+| `overlap_dispatch_pull` | `False` | Boolean. Select the next route during a row load and overlap completion of the preceding pool store with the next load. Arrival publication still follows store completion. Cannot be combined with `dispatch_dedup`. |
 
 Dispatch and startup options affect Mega execution, not lean/split FC12.
 Use `validate_tactic` for host validation and `resolve_tactic` to inspect the
@@ -108,9 +129,9 @@ In the next table, append each suffix to `FLASHINFER_MXFP8_MXFP4_`.
 
 | Suffix | Default | Purpose |
 |---|---|---|
-| `EPILOGUE_WARPS` | Tactic policy | `4` or `8`; replaces the default width. |
-| `IN_KERNEL_REDUCE` | Tactic policy | `0` or `1`; replaces the default reduction placement. |
-| `LOAD_BALANCE_MODE` | Tactic policy | `static`, `atomic_counter`, or `alternating`. |
+| `EPILOGUE_WARPS` | Unset/empty: tactic policy | `4` or `8`; replaces the default width. |
+| `IN_KERNEL_REDUCE` | Unset/empty: tactic policy | `0` or `1`; replaces the default reduction placement. |
+| `LOAD_BALANCE_MODE` | Unset/empty: tactic policy | `static`, `atomic_counter`, or `alternating`. |
 | `FC2_STORE_MODE` | `staged256` | `direct`, `staged64`, or `staged256`. |
 | `DISPATCH_DEDUP` | `0` | `0` or `1`; replaces the dedup tactic default. |
 | `STARTUP_PREFETCH_WAVES` | `0` | `0`, `1`, `2`, or `3`; replaces the prefetch tactic default. |
@@ -122,11 +143,18 @@ In the next table, append each suffix to `FLASHINFER_MXFP8_MXFP4_`.
 | `WAIT_STATS` | `0` | `1` allocates and instruments per-CTA wait statistics and the startup ring. Set before workspace allocation. Read via `read_mega_wait_stats`, `read_mega_startup_ring`, `summarize`, and `decode_startup_ring` in `wait_stats_config.py`. |
 | `IKET_FINE_CTAS` | `0` | Number of initial CTAs with detailed IKET ranges; requires `CUTE_DSL_COMPILER_OPT=iket`. Overlapped-pull tracing instruments at least one CTA, including when this is unset. |
 
-Additional controls: `FLASHINFER_MEGA_FUSED_STAGE=0` disables fused input
-quantization/staging; `FLASHINFER_MOE_EP_KNOB_CACHE` selects the tuning cache
-file (`0` or `off` disables it); `MEGA_NO_DIST=1` selects single-process
-setup. `MEGA_USE_NCU=1` selects the profiling tail signal path. Instrumentation
-changes timing, so disable it when selecting performance winners.
+Related controls use their full names below:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `FLASHINFER_MEGA_FUSED_STAGE` | `1` | Use fused input quantization/staging when eligible; `0` disables it. Prequantized inputs are copied unchanged. |
+| `FLASHINFER_MOE_EP_KNOB_CACHE` | Unset/empty: `~/.cache/flashinfer/moe_ep_knob_cache.json` | Override the tuning-cache file. `0`, `off`, `none`, `disable`, or `disabled` disable reads and writes (case-insensitive, whitespace trimmed for these disable values). |
+| `MEGA_NO_DIST` | `0` | `1` selects single-process setup; keep `0` for distributed EP. |
+| `MEGA_USE_NCU` | `0` | `1` selects the profiling tail signal path. |
+| `FLASHINFER_MOE_EP_SKIP_DSL_CHECK` | Unset: check enabled | `1` bypasses the shared shim's CuTe DSL version check. |
+| `CUTE_DSL_COMPILER_OPT` | Unset/empty: no IKET instrumentation | Include the `iket` token to enable this kernel's IKET markers; `IKET_FINE_CTAS` controls detailed CTA coverage. |
+
+Instrumentation changes timing, so disable it when selecting performance winners.
 
 ## Autotuning
 
@@ -159,6 +187,36 @@ For one GPU, replace the `torchrun` prefix with
 `--max-tokens` accepts several capacities, with a separate sweep for each.
 Omit `--live-tokens` to use each capacity as its live count.
 
+Every CLI option is listed below. Required geometry arguments have no built-in
+values. Defaults belong to the shared CLI; in particular, always supply
+`--dtype mxfp8_mxfp4` to select this backend.
+
+| Option | Default | Behavior for this backend |
+|---|---|---|
+| `--dtype` | `nvfp4` | Set to `mxfp8_mxfp4`. |
+| `--arch` | `auto` | Auto selects `sm107` on compute capability `(10, 7)`, `sm100` otherwise. This backend requires `sm100`; an unsupported family is rejected. |
+| `--hidden` | Required | Activation/output width. |
+| `--intermediate` | Required | Post-SwiGLU width. |
+| `--num-experts` | Required | Total experts across EP ranks. |
+| `--topk` | Required | Routes per token. |
+| `--max-tokens` | Required | One or more workspace capacities per rank. |
+| `--live-tokens` | `None` | Use each capacity as its live token count; a supplied count must be positive and no larger than any requested capacity. |
+| `--gate-up-clamp` | `None` | No activation clamp. |
+| `--combine-dtype` | `bf16` | Only `bf16` is accepted with `mxfp8_mxfp4`. |
+| `--fp8-scale-mode` | `per_tensor` | Applies only to the Hopper FP8 backends; ignored here. Activations always use E8M0/K32 scales. |
+| `--allow-nondeterministic` | `False` | Adds no candidates here; reduction remains deterministic. |
+| `--max-candidates` | `None` | No truncation; a positive value keeps that many candidates from the front of the list. |
+| `--skew` | `None` | Near-uniform random routing. A supplied ratio requests skewed routing. |
+| `--sweep` | `default` | Full candidate grid; `schedule` sweeps only scheduling fields. |
+| `--base-knobs` | `None` | For `schedule`, use the default tactic for this capacity and geometry, including environment defaults. Supplied JSON overrides it. This backend does not use a cached winner as the schedule base. Ignored by the default sweep. |
+| `--warmup-iters` | 3 | Warmup launches per candidate; the first launch compiles if needed. |
+| `--timed-iters` | 10 | Timed launches per candidate. |
+| `--seed` | 0 | Synthetic inputs/routing use `seed + rank`. |
+| `-h`, `--help` | Not requested | Print CLI help and exit. |
+
+The CLI uses `fast_math=True`; there is no CLI flag for it. Use the explicit
+Python tuner to compare a different numerical setting.
+
 The default pair-tile search has 32 candidates: 24 static candidates over
 N64/N128/N192, group hints 512/4096, four/eight epilogue warps, and both
 reduction placements; four alternating N192 candidates; and four atomic N64
@@ -177,6 +235,34 @@ schedule sweep. `--seed` controls synthetic inputs and routing;
 and deterministic reduction, so `--allow-nondeterministic` adds no candidates.
 
 ### Explicit candidate sweep
+
+The helpers in [`integration.py`](integration.py) use the following defaults.
+Geometry, rank/world size, weights, workspace, and live-token arguments are
+required wherever they appear in a signature; they have no implicit values.
+
+| API | Optional argument | Default and behavior |
+|---|---|---|
+| `get_symm_buffer_for_mxfp8_mxfp4_mega_moe` | `knobs` | `None`: persistent cache lookup, then the default tactic. This low-level allocator accepts a mapping or `None`, not `"auto"`. |
+| Same allocator | `capacity_tactics` | `None`: size only for the resolved tactic. Supply a sequence to reserve enough space for every listed candidate as well. |
+| Same allocator | `gate_up_clamp` | `None`: accepted for API compatibility but unused during allocation. Set the clamp on compute/tuner calls. |
+| `mxfp8_mxfp4_mega_moe` | `gate_up_clamp` | `None`: no clamp. |
+| Same compute function | `fast_math` | `True`: approximate SwiGLU math. |
+| `autotune_mxfp8_mxfp4_mega_moe` | `gate_up_clamp` | `None`: no clamp. |
+| Same tuner | `fast_math` | `True`: approximate SwiGLU math, held fixed across candidates. |
+| Same tuner | `candidates` | `None`: use the 32-candidate grid for the workspace geometry, then filter for workspace fit. |
+| Same tuner | `warmup_iters` | 3 warmup launches per candidate; the first launch compiles if needed. |
+| Same tuner | `timed_iters` | 10 timed launches per candidate. |
+| `create_dummy_mxfp8_mxfp4_inputs` | `seed` | 0: seed the local GPU generator with `seed + rank`. |
+| Same input helper | `capacity_tactics` | `None`: reserve for the full candidate grid. An explicit empty sequence reserves only for the default tactic. |
+| Same input helper | `gate_up_clamp` | `None`: accepted but unused during input generation. Set it on compute/tuner calls. |
+
+Both compute and tuner require the positional `output` argument. Passing
+`None` to compute uses `workspace.y`; the tuner ignores `output` and always
+times the workspace's stable output view. `num_tokens` is required on both
+calls. The input helper starts from `knobs={}` (bypassing the cache), creates
+near-uniform random expert assignments, and sets each routing weight to
+`1 / topk`. Backend `knobs="auto"` reserves for the full candidate grid and
+uses the tuner's default iteration counts with the config's numerical settings.
 
 This single-GPU example uses deliberately small synthetic fixtures. Run it
 with `MEGA_NO_DIST=1`. The helper stages random inputs, preprocesses weights,
