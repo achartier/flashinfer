@@ -78,7 +78,9 @@ class Mxfp8DispatchPhase:
     :meth:`shared_storage_type` in its CTA shared storage, constructs the
     existing token-communication argument bundle with :meth:`make_args`, then
     calls this object from each dispatch warp.  The scheduler warp must call
-    :meth:`scheduler_wait` before consuming expert counts.
+    :meth:`scheduler_wait` before consuming expert counts. The MXFP8 override
+    overwrites owner-side counts each launch and needs only one tail drain;
+    other backends retain the vendored helper's reset protocol.
     """
 
     def __init__(
@@ -90,6 +92,9 @@ class Mxfp8DispatchPhase:
         num_other_warps: int,
         flag_batch: int = 1,
         rank: int = 0,
+        vector_count_publish: bool = False,
+        cta_local_counts: bool = False,
+        overlap_dispatch_pull: bool = False,
     ) -> None:
         if not 1 <= config.world_size <= 16:
             raise ValueError("NVLink dispatch supports 1 <= world_size <= 16")
@@ -110,13 +115,45 @@ class Mxfp8DispatchPhase:
         self.dispatch_warp_start = dispatch_warp_start
         self.num_other_warps = num_other_warps
         self.flag_batch = flag_batch
+        self.vector_count_publish = vector_count_publish
+        if overlap_dispatch_pull and config.dispatch_dedup:
+            raise ValueError(
+                "overlap_dispatch_pull cannot be combined with dispatch_dedup"
+            )
+        self.cta_local_counts = cta_local_counts
+        self.overlap_dispatch_pull = overlap_dispatch_pull
         self._token_comm: Any | None = None
         self._tail_reduce: Any | None = None
 
-    def bind_in_kernel_reduce(self, route_terms: Any, output: Any) -> None:
+    def bind_in_kernel_reduce(
+        self, route_terms: Any, output: Any, *, scratch: Any, scratch_bytes: int
+    ) -> None:
         """Bind device-region operands for the optional all-warp tail reduce."""
 
+        import os
+
+        from .combine import PipelinedInKernelTopKReduction, combine_chunk_elements
         from .fc2_epilogue import InKernelTopKReduction
+
+        chunk = combine_chunk_elements(
+            self.config.hidden,
+            self.num_other_warps + self.num_dispatch_warps,
+            scratch_bytes,
+        )
+        if (
+            os.environ.get("FLASHINFER_MXFP8_MXFP4_PIPELINED_COMBINE", "0") == "1"
+            and chunk
+            and self.config.num_topk <= 32
+        ):
+            self._tail_reduce = PipelinedInKernelTopKReduction(
+                hidden=self.config.hidden,
+                num_topk=self.config.num_topk,
+                route_terms=route_terms,
+                output=output,
+                scratch=scratch,
+                chunk=chunk,
+            )
+            return
 
         self._tail_reduce = InKernelTopKReduction(
             hidden=self.config.hidden,
@@ -134,7 +171,35 @@ class Mxfp8DispatchPhase:
                 token_comm as token_comm_module,
             )
 
-            comm_class = token_comm_module.TokenInPullTokenBackPush
+            from .tail import overwrite_count_token_comm_class
+
+            comm_class = overwrite_count_token_comm_class(
+                token_comm_module.TokenInPullTokenBackPush
+            )
+            if self.overlap_dispatch_pull:
+                from .dispatch_overlap import overlapping_token_comm_class
+
+                comm_class = overlapping_token_comm_class(comm_class)
+            if self.config.dispatch_dedup:
+                from .dispatch_dedup import deduplicating_token_comm_class
+                from .workspace import make_workspace_plan
+
+                plan = make_workspace_plan(self.config)
+                shared = plan.shared
+                stats_offsets = _dispatch_stats_word_offsets(self.config)
+                fetch_stats_offset = None
+                if stats_offsets is not None:
+                    fetch_stats_offset = (
+                        plan.local.region("wait_stats").offset
+                        - plan.local.region("l1_arrival_count").offset
+                    ) // 4
+                sibling_offset = (
+                    shared.region("src_sibling_idx").offset
+                    - shared.region("src_token_topk_idx").offset
+                ) // 4
+                comm_class = deduplicating_token_comm_class(
+                    comm_class, sibling_offset, fetch_stats_offset
+                )
             stats_offsets = _dispatch_stats_word_offsets(self.config)
             if stats_offsets is not None:
                 comm_class = _timed_token_comm_class(comm_class)
@@ -155,6 +220,8 @@ class Mxfp8DispatchPhase:
                 fc1_token_dtype=cutlass.Float8E4M3FN,
                 combine_format=None,
             )
+            self._token_comm.vector_count_publish = self.vector_count_publish
+            self._token_comm.cta_local_counts = self.cta_local_counts
             if stats_offsets is not None:
                 self._token_comm.stats_word_offsets = stats_offsets
         return self._token_comm
@@ -212,6 +279,8 @@ class Mxfp8DispatchPhase:
     ) -> None:
         """Run prep, barrier, pull, metadata, and readiness publication."""
 
+        # The body's dispatch-to-scheduler named barrier publishes this CTA's
+        # count stores even when startup omits the closing grid rendezvous.
         self.token_comm.dispatch_warp_body(
             token_comm_args,
             token_comm_storage,
@@ -220,6 +289,19 @@ class Mxfp8DispatchPhase:
             tidx=tidx,
         )
 
+    def bind_local_counts(self, token_comm_args: Any, storage: Any) -> Any:
+        """Reuse dead prep scratch for CTA-private counts, without growing SMEM."""
+        import cutlass.cute as cute
+
+        counts = cute.make_tensor(
+            storage.smem_expert_count.data_ptr(),
+            cute.make_layout((self.config.num_experts_per_rank,)),
+        )
+        # Keep the packed global ABI for diagnostics; only CTA 0 writes it.
+        self.token_comm.global_count_sum = token_comm_args.expert_recv_count_sum
+        token_comm_args.expert_recv_count_sum = counts
+        return counts
+
     def scheduler_wait(self, token_comm_args: Any) -> None:
         """Rendezvous the scheduler with published expert counts."""
 
@@ -227,24 +309,6 @@ class Mxfp8DispatchPhase:
 
     def fc1_ready_counter_ptr(self, token_comm_args: Any) -> Any:
         return self.token_comm.fc1_ready_counter_ptr(token_comm_args)
-
-    def tail_reset_shared_counters(
-        self,
-        token_comm_args: Any,
-        *,
-        cta_linear_id: Any,
-        local_warp_idx: Any,
-        lane_idx: Any,
-    ) -> None:
-        """Delegate the persistent tail's shared counter reset."""
-
-        self.token_comm.tail_reset_counters(
-            token_comm_args,
-            token_comm_args.shared_zero_prefix,
-            cta_linear_id=cta_linear_id,
-            local_warp_idx=local_warp_idx,
-            lane_idx=lane_idx,
-        )
 
     def kernel_tail(
         self,
@@ -298,22 +362,98 @@ def _dispatch_stats_word_offsets(config: WorkspaceConfig) -> dict[str, int] | No
 
 
 def _timed_token_comm_class(base: Any) -> type:
-    """Debug: ``base`` with round-5 start-up probes (wait-stats knob only).
+    """Debug: ``base`` with start-up and tail probes (wait-stats knob only).
 
-    Wraps the vendored dispatch phases without changing them. Each probe is
+    Wraps the vendored dispatch phases without changing them; the start-up
+    NVLink barrier is re-traced here with CTA 0's signal send and spin timed
+    (same protocol), feeding the ``STARTUP_*`` slots and the per-launch ring. Each probe is
     one relaxed add by local dispatch warp 0, lane 0 of every CTA, into the
     ``wait_stats`` region reached from a workspace tensor the phase receives.
     """
 
     import cutlass
     import cutlass.cute as cute
-    from cutlass.cutlass_dsl import Int32
+    from cutlass.cutlass_dsl import Int32, Int64
+
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.src.src.grid_sync import (
+        software_grid_sync,
+    )
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.src.src.ptx_helpers import (
+        red_add_release_sys_s32_raw,
+    )
 
     from .wait_stats import Slot, globaltimer_lo, stat_add
-    from .wait_stats_config import SLOTS
+    from .wait_stats_config import SLOTS, STARTUP_RING_ENTRIES, STATS_WORDS
 
     class TimedTokenComm(base):  # type: ignore[misc, valid-type]
         stats_word_offsets: dict[str, int] = {}
+
+        @cute.jit
+        def kernel_tail(
+            self,
+            token_comm_args,
+            *,
+            warp_idx,
+            lane_idx,
+            tidx,
+            tail_work: cutlass.Constexpr = None,
+        ):
+            self._tail_barrier_index = 0
+            self._tail_reset_index = 0
+            self._in_kernel_tail = True
+            start = globaltimer_lo()
+            base.kernel_tail(
+                self,
+                token_comm_args,
+                warp_idx=warp_idx,
+                lane_idx=lane_idx,
+                tidx=tidx,
+                tail_work=tail_work,
+            )
+            self._in_kernel_tail = False
+            self._stamp(
+                token_comm_args.grid_sync_counter.iterator,
+                "grid_sync_counter",
+                self._cta_linear_id(),
+                Int32(warp_idx) - Int32(self.dispatch_warp_start),
+                lane_idx,
+                Slot.TAIL_DISPATCH_NS,
+                globaltimer_lo() - start,
+            )
+
+        @cute.jit
+        def tail_reset_counters(
+            self,
+            token_comm_args,
+            target_zero_tensor,
+            *,
+            cta_linear_id,
+            local_warp_idx,
+            lane_idx,
+        ):
+            start = globaltimer_lo()
+            base.tail_reset_counters(
+                self,
+                token_comm_args,
+                target_zero_tensor,
+                cta_linear_id=cta_linear_id,
+                local_warp_idx=local_warp_idx,
+                lane_idx=lane_idx,
+            )
+            # The optimized tail only resets the local prefix.
+            local = (
+                getattr(self, "overwrite_counts", False) or self._tail_reset_index > 0
+            )
+            self._tail_reset_index += 1
+            self._stamp(
+                token_comm_args.grid_sync_counter.iterator,
+                "grid_sync_counter",
+                cta_linear_id,
+                local_warp_idx,
+                lane_idx,
+                Slot.TAIL_LOCAL_RESET_NS if local else Slot.TAIL_SHARED_RESET_NS,
+                globaltimer_lo() - start,
+            )
 
         @cute.jit
         def _stamp(self, base_ptr, region, sm_idx, warp_idx, lane_idx, slot, value):
@@ -341,6 +481,7 @@ def _timed_token_comm_class(base: Any) -> type:
             num_sms,
         ):
             start = globaltimer_lo()
+            self._prep_start = start
             base.dispatch_prep(
                 self,
                 token_comm_storage,
@@ -403,7 +544,28 @@ def _timed_token_comm_class(base: Any) -> type:
                 nvlink_barrier_counter=nvlink_barrier_counter,
             )
             self._in_dispatch_barrier = False
-            if cutlass.const_expr(not self._nvlink_probed):
+            if cutlass.const_expr(self._nvlink_probed):
+                self._stamp(
+                    grid_sync_counter.iterator,
+                    "grid_sync_counter",
+                    sm_idx,
+                    warp_idx,
+                    lane_idx,
+                    Slot.STARTUP_GRID_SYNC_NS,
+                    globaltimer_lo() - self._signal_done,
+                )
+                # Include count publication and its handoff (CTA-local in the
+                # optimized path, closing grid sync in the original path).
+                self._stamp(
+                    grid_sync_counter.iterator,
+                    "grid_sync_counter",
+                    sm_idx,
+                    warp_idx,
+                    lane_idx,
+                    Slot.DISPATCH_NVLINK_BARRIER_NS,
+                    globaltimer_lo() - self._nvlink_start,
+                )
+            else:
                 self._stamp(
                     grid_sync_counter.iterator,
                     "grid_sync_counter",
@@ -413,6 +575,21 @@ def _timed_token_comm_class(base: Any) -> type:
                     Slot.DISPATCH_SYNC_SEND_NS,
                     globaltimer_lo() - self._barrier_start,
                 )
+
+        @cute.jit
+        def _record_startup_signal(self, grid_sync_counter, send_at, wait):
+            arrival = send_at - self._prep_start
+            stats = grid_sync_counter.iterator + Int32(
+                self.stats_word_offsets["grid_sync_counter"]
+            )
+            stat_add(stats + Int32(Slot.STARTUP_LOCAL_ARRIVAL_AT_NS), arrival)
+            stat_add(stats + Int32(Slot.STARTUP_SIGNAL_WAIT_NS), wait)
+            ring = stats + Int32(STATS_WORDS)
+            launch = cute.arch.atomic_add(ring, Int32(1), sem="relaxed", scope="gpu")
+            entry = ring + Int32(1) + (launch % Int32(STARTUP_RING_ENTRIES)) * Int32(3)
+            stat_add(entry, launch + Int32(1))
+            stat_add(entry + Int32(1), arrival)
+            stat_add(entry + Int32(2), wait)
 
         @cute.jit
         def nvlink_barrier(
@@ -429,12 +606,14 @@ def _timed_token_comm_class(base: Any) -> type:
             prologue_grid_sync: cutlass.Constexpr[bool],
             epilogue_grid_sync: cutlass.Constexpr[bool],
         ):
-            # Only the start-up call from dispatch_barrier is probed (a
-            # trace-time flag); the kernel-tail barriers are not.
+            # Trace-time flags distinguish start-up from tail barriers.
             probe = getattr(self, "_in_dispatch_barrier", False)
+            tail_probe = getattr(self, "_in_kernel_tail", False)
+            if cutlass.const_expr(tail_probe):
+                tail_start = globaltimer_lo()
             if cutlass.const_expr(probe):
                 self._nvlink_probed = True
-                start = globaltimer_lo()
+                self._nvlink_start = globaltimer_lo()
                 self._stamp(
                     grid_sync_counter.iterator,
                     "grid_sync_counter",
@@ -442,31 +621,97 @@ def _timed_token_comm_class(base: Any) -> type:
                     warp_idx,
                     lane_idx,
                     Slot.DISPATCH_SYNC_SEND_NS,
-                    start - self._barrier_start,
+                    self._nvlink_start - self._barrier_start,
                 )
-            base.nvlink_barrier(
-                self,
-                nvlink_barrier_signal,
-                nvlink_barrier_counter,
-                grid_sync_counter,
-                peer_rank_ptr_mapper,
-                sm_idx,
-                warp_idx,
-                lane_idx,
-                num_sms=num_sms,
-                prologue_grid_sync=prologue_grid_sync,
-                epilogue_grid_sync=epilogue_grid_sync,
-            )
-            if cutlass.const_expr(probe):
+                # Start-up split: the vendored barrier with CTA 0's signal
+                # send and spin timed, plus a per-launch ring entry. The
+                # protocol is unchanged (same counter, slots and ordering).
+                tid_in_group = warp_idx * Int32(self.warp_threads) + lane_idx
+                if cutlass.const_expr(prologue_grid_sync):
+                    software_grid_sync(
+                        grid_sync_counter,
+                        sm_idx,
+                        num_sms,
+                        tid_in_group,
+                        num_threads=self.num_dispatch_threads,
+                    )
+                if sm_idx == 0:
+                    if warp_idx == 0:
+                        status = nvlink_barrier_counter[0] & Int32(3)
+                        signal_phase = status & Int32(1)
+                        signal_sign = status >> Int32(1)
+                        signal_delta = Int32(1)
+                        target = Int32(self.world_size)
+                        if signal_sign != Int32(0):
+                            signal_delta = Int32(-1)
+                            target = Int32(0)
+                        nbs_local_base = nvlink_barrier_signal.iterator.toint()
+                        send_at = globaltimer_lo()
+                        if lane_idx < Int32(self.world_size):
+                            lane_peer_addr = peer_rank_ptr_mapper.map(
+                                nbs_local_base,
+                                lane_idx,
+                                Int64(signal_phase * Int32(4)),
+                            )
+                            red_add_release_sys_s32_raw(lane_peer_addr, signal_delta)
+                        cute.arch.sync_warp()
+                        if lane_idx == 0:
+                            cute.arch.atomic_add(
+                                nvlink_barrier_counter.iterator,
+                                Int32(1),
+                                sem="relaxed",
+                                scope="gpu",
+                            )
+                            local_signal_ptr = (
+                                nvlink_barrier_signal.iterator + signal_phase
+                            )
+                            while (
+                                cute.arch.load(
+                                    local_signal_ptr, Int32, sem="acquire", scope="sys"
+                                )
+                                != target
+                            ):
+                                pass
+                            wait = globaltimer_lo() - send_at
+                            self._record_startup_signal(
+                                grid_sync_counter, send_at, wait
+                            )
+                if cutlass.const_expr(epilogue_grid_sync):
+                    software_grid_sync(
+                        grid_sync_counter,
+                        sm_idx,
+                        num_sms,
+                        tid_in_group,
+                        num_threads=self.num_dispatch_threads,
+                    )
+                self._signal_done = globaltimer_lo()
+            else:
+                base.nvlink_barrier(
+                    self,
+                    nvlink_barrier_signal,
+                    nvlink_barrier_counter,
+                    grid_sync_counter,
+                    peer_rank_ptr_mapper,
+                    sm_idx,
+                    warp_idx,
+                    lane_idx,
+                    num_sms=num_sms,
+                    prologue_grid_sync=prologue_grid_sync,
+                    epilogue_grid_sync=epilogue_grid_sync,
+                )
+            if cutlass.const_expr(tail_probe):
                 self._stamp(
                     grid_sync_counter.iterator,
                     "grid_sync_counter",
                     sm_idx,
                     warp_idx,
                     lane_idx,
-                    Slot.DISPATCH_NVLINK_BARRIER_NS,
-                    globaltimer_lo() - start,
+                    Slot.TAIL_DRAIN_BARRIER_NS
+                    if self._tail_barrier_index == 0
+                    else Slot.TAIL_PUBLISH_BARRIER_NS,
+                    globaltimer_lo() - tail_start,
                 )
+                self._tail_barrier_index += 1
 
     return TimedTokenComm
 
@@ -497,6 +742,8 @@ class SingleRankMxfp8Dispatch:
         *,
         num_sms: int | None = None,
         flag_batch: int = 1,
+        cta_local_counts: bool = False,
+        overlap_dispatch_pull: bool = False,
     ) -> None:
         if config.world_size != 1:
             raise NotImplementedError(
@@ -509,6 +756,12 @@ class SingleRankMxfp8Dispatch:
         self.config = config
         self.num_sms = num_sms
         self.flag_batch = flag_batch
+        if overlap_dispatch_pull and config.dispatch_dedup:
+            raise ValueError(
+                "overlap_dispatch_pull cannot be combined with dispatch_dedup"
+            )
+        self.cta_local_counts = cta_local_counts
+        self.overlap_dispatch_pull = overlap_dispatch_pull
 
     @staticmethod
     def _require_tensor(
@@ -590,6 +843,8 @@ class SingleRankMxfp8Dispatch:
             dispatch_warp_start=0,
             num_other_warps=1,
             flag_batch=self.flag_batch,
+            cta_local_counts=self.cta_local_counts,
+            overlap_dispatch_pull=self.overlap_dispatch_pull,
         )
 
         @cute.kernel
@@ -639,6 +894,8 @@ class SingleRankMxfp8Dispatch:
                 peer_rank_ptr_mapper=peer_rank_ptr_mapper,
                 sm_count=num_sms,
             )
+            if cutlass.const_expr(phase.cta_local_counts):
+                phase.bind_local_counts(args, storage)
             tidx, _, _ = cute.arch.thread_idx()
             warp_idx = tidx // 32
             lane_idx = tidx % 32

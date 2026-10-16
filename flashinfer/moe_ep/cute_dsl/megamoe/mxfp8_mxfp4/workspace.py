@@ -148,6 +148,7 @@ class WorkspaceConfig:
     sf_padding_block: int
     cluster_tile_tokens: int
     load_balance_mode: Literal["static", "atomic_counter", "alternating"] = "static"
+    dispatch_dedup: bool = False
     token_back_by_dispatch: bool = False
     token_back_schedule_mode: Literal["static", "atomic_counter"] = "static"
 
@@ -166,6 +167,16 @@ class WorkspaceConfig:
         for name, value in positive.items():
             if value <= 0:
                 raise ValueError(f"{name} must be positive, got {value}")
+        if self.dispatch_dedup and (
+            self.max_tokens_per_rank
+            * self.num_topk
+            * self.num_experts_per_rank
+            * self.world_size
+            >= 2**31
+        ):
+            raise ValueError(
+                "dispatch_dedup table and sibling indices must fit signed int32"
+            )
         if self.num_topk > 32:
             raise ValueError("num_topk must be at most 32")
         if self.hidden % MXFP8_SF_VEC_SIZE:
@@ -244,7 +255,6 @@ def local_region_specs(config: WorkspaceConfig) -> tuple[RegionSpec, ...]:
     specs: list[RegionSpec] = [
         _region("l1_arrival_count", "int32", 4, (config.pool_task_tile_capacity,)),
         _region("expert_send_count", "int64", 8, (config.num_total_experts,)),
-        _region("grid_sync_counter", "int32", 4, (GRID_SYNC_SLOT_COUNT,)),
         _region("fc1_done_counter", "int32", 4, (config.fc1_done_slots,)),
     ]
     if config.token_back_by_dispatch:
@@ -264,6 +274,9 @@ def local_region_specs(config: WorkspaceConfig) -> tuple[RegionSpec, ...]:
     specs.extend(
         [
             _region("l1_token_buffer", "uint8", 1, (pool, config.hidden), 128),
+            # Both synchronization protocols carry their phase across launches.
+            # Only first-use initialization may clear these regions.
+            _region("grid_sync_counter", "int32", 4, (GRID_SYNC_SLOT_COUNT,)),
             _region("nvlink_barrier_counter", "int32", 4, (1,)),
             _region(
                 "l1_sf_buffer",
@@ -287,12 +300,13 @@ def local_region_specs(config: WorkspaceConfig) -> tuple[RegionSpec, ...]:
         specs.append(
             _region("fc2_output_workspace", "bfloat16", 2, (pool, config.hidden), 128)
         )
-    from .wait_stats_config import STATS_WORDS, wait_stats_enabled
+    from .wait_stats_config import MEGA_STATS_WORDS, wait_stats_enabled
 
     if wait_stats_enabled():
         # Debug-only; after the data regions so the tail's zero-prefix reset
-        # keeps it. Accumulates across launches; the reader zeroes it.
-        specs.append(_region("wait_stats", "int32", 4, (STATS_WORDS,)))
+        # keeps it. Accumulates across launches; the reader zeroes it. The
+        # per-CTA block is followed by the start-up ring.
+        specs.append(_region("wait_stats", "int32", 4, (MEGA_STATS_WORDS,)))
     return tuple(specs)
 
 
@@ -311,6 +325,18 @@ def shared_region_specs(config: WorkspaceConfig) -> tuple[RegionSpec, ...]:
             "int32",
             4,
             (config.num_experts_per_rank, config.world_size, max_slot),
+        ),
+        *(
+            (
+                _region(
+                    "src_sibling_idx",
+                    "int32",
+                    4,
+                    (config.num_experts_per_rank, config.world_size, max_slot),
+                ),
+            )
+            if config.dispatch_dedup
+            else ()
         ),
         _region("nvlink_barrier_signal", "int32", 4, (NVLINK_SIGNAL_SLOT_COUNT,)),
     )

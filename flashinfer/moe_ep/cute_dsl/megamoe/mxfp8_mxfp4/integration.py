@@ -62,6 +62,7 @@ def _workspace_plan(
             sf_padding_block=128,
             cluster_tile_tokens=cluster_tokens,
             load_balance_mode=tactic["load_balance_mode"],
+            dispatch_dedup=tactic["dispatch_dedup"],
             token_back_by_dispatch=tactic["token_back_mode"] == "reuse_dispatch_warps",
             token_back_schedule_mode=tactic["token_back_schedule_mode"],
         )

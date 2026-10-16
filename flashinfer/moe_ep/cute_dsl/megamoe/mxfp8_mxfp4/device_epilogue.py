@@ -6,8 +6,9 @@
 The swap-AB MMA leaves feature rows and token columns in TMEM. FC1's
 16dp256b loads match the gate8/up8 weight interleave, so each lane computes
 SwiGLU directly without transposing or exchanging gate/up values. Only K32
-block maxima cross lanes and paired warps. FC2 retains the token-major
-register transpose for contiguous BF16 route stores.
+block maxima cross lanes and paired warps. FC2 can use either the original
+register transpose or native loads with a shared-memory BF16 transpose and
+coalesced route stores.
 
 This module owns accumulator wait/release, tile traversal, output stores,
 and FC1 readiness publication after the output data and scales are visible.
@@ -41,6 +42,7 @@ from .fc1_epilogue import (
     _quantize_with_amax,
 )
 from .fc1_store import fc1_tma_store_enabled, issue_fc1_store, store_native_e4m3
+from .fc2_store import stage_native_bf16, store_staged_vector
 from .wait_stats import Slot, globaltimer_lo, stat_add, stats_slot_ptr
 from .iket_markers import iket_enabled, iket_fine_ctas, is_fine_cta, load_iket
 from .fc2_epilogue import FC2_EPILOGUE_TILE, Fc2Bf16Epilogue, Fc2RouteStore
@@ -103,6 +105,7 @@ class DeviceEpilogueConfig:
     cta_tile_tokens: int = 128
     accumulator_stages: int = 2
     epilogue_warps: int = EPILOGUE_WARPS
+    fc2_store_mode: str = "direct"
     barrier_id: int = 1
     gate_up_clamp: Optional[float] = None
     fast_math: bool = True
@@ -133,6 +136,8 @@ class DeviceEpilogueConfig:
             )
         if self.epilogue_warps not in (4, 8):
             raise ValueError("the epilogue requires four or eight warps")
+        if self.fc2_store_mode not in ("direct", "staged64", "staged256"):
+            raise ValueError("unsupported fc2_store_mode")
         if self.barrier_id < 0:
             raise ValueError("barrier_id must be non-negative")
         if self.epilogue_warps == 8 and self.barrier_id in EXCHANGE_BARRIER_IDS:
@@ -773,6 +778,8 @@ class PersistentMxfp8Mxfp4Epilogue:
         acc_stage,
         route_store: Fc2RouteStore,
         token_metadata,
+        epilogue_exchange,
+        boundary,
         warp_idx,
         lane_idx,
         warpgroup_idx,
@@ -792,6 +799,8 @@ class PersistentMxfp8Mxfp4Epilogue:
                             acc_stage=acc_stage,
                             route_store=route_store,
                             token_metadata=token_metadata,
+                            epilogue_exchange=epilogue_exchange,
+                            boundary=boundary,
                             warp_idx=warp_idx,
                             lane_idx=lane_idx,
                         )
@@ -803,9 +812,105 @@ class PersistentMxfp8Mxfp4Epilogue:
                         acc_stage=acc_stage,
                         route_store=route_store,
                         token_metadata=token_metadata,
+                        epilogue_exchange=epilogue_exchange,
+                        boundary=boundary,
                         warp_idx=warp_idx,
                         lane_idx=lane_idx,
                     )
+
+    @cute.jit
+    def _run_fc2_staged_group(
+        self,
+        work,
+        token_group: cutlass.Constexpr[int],
+        tmem_acc_tensor,
+        acc_stage,
+        route_store,
+        token_metadata,
+        epilogue_exchange,
+        boundary,
+        warp_idx,
+        lane_idx,
+    ):
+        mode = self.config.fc2_store_mode
+        staging = epilogue_exchange.iterator
+        first = self._load_fc1_native_half(
+            tmem_acc_tensor, warp_idx, Int32(token_group), acc_stage, 0
+        )
+        second = self._load_fc1_native_half(
+            tmem_acc_tensor, warp_idx, Int32(token_group), acc_stage, 1
+        )
+        # Resolve each token's destination once in its emitting warp. Broadcast
+        # the final address, avoiding repeated peer lookup and row arithmetic
+        # in every lane that stores a 16-byte piece of the same row.
+        token_base = Int32(token_group * WARP_SIZE)
+        pool_base = work.cumulative_data_physical_row + work.tile_n_idx * Int32(
+            self.config.cta_tile_tokens
+        )
+        metadata_token = lane_idx
+        metadata_lane = cutlass.Boolean(True)
+        if cutlass.const_expr(mode == "staged256"):
+            metadata_token = (warp_idx % 4) * 4 + lane_idx % 4 + (lane_idx // 4) * 16
+            metadata_lane = lane_idx < 8
+        row_address = Int64(0)
+        if (
+            metadata_lane
+            and token_base + metadata_token < work.valid_tokens_in_cta_tile
+        ):
+            source_rank = Int32(0)
+            source_token = pool_base + token_base + metadata_token
+            source_topk = Int32(0)
+            if cutlass.const_expr(token_metadata is not None):
+                source_rank, source_token, source_topk = _load_route_metadata(
+                    token_metadata, source_token
+                )
+            row_address = route_store.resolve_route_row(
+                source_rank, source_token, source_topk
+            ).iterator.toint()
+        address_lo = row_address.to(cutlass.Uint32)
+        address_hi = (row_address >> Int64(32)).to(cutlass.Uint32)
+
+        for chunk in cutlass.range_constexpr(2):
+            stage_native_bf16(first, staging, warp_idx, lane_idx, 0, chunk, mode)
+            stage_native_bf16(second, staging, warp_idx, lane_idx, 1, chunk, mode)
+            if cutlass.const_expr(mode == "staged64"):
+                cute.arch.sync_warp()
+            else:
+                boundary.arrive_and_wait()
+            for stripe in cutlass.range_constexpr(2):
+                if cutlass.const_expr(mode == "staged64"):
+                    token = lane_idx // 4 + stripe * 8 + chunk * 16
+                    feature = (warp_idx % 4) * 32 + (lane_idx % 4) * 8
+                    offset = warp_idx * 1024 + (token % 16) * 64 + (lane_idx % 4) * 16
+                    metadata_source = token
+                    mask = 0x30
+                else:
+                    token = (
+                        (warp_idx % 4) * 4 + lane_idx // 16 + stripe * 2 + chunk * 16
+                    )
+                    feature = (lane_idx % 16) * 8
+                    offset = (warp_idx // 4) * 4096 + (token % 16) * 256 + feature * 2
+                    metadata_source = lane_idx // 16 + stripe * 2 + chunk * 4
+                    mask = 0x70
+                # All lanes shuffle, even when the final token group is partial.
+                address = Int64(cute.arch.shuffle_sync(address_lo, metadata_source)) | (
+                    Int64(cute.arch.shuffle_sync(address_hi, metadata_source))
+                    << Int64(32)
+                )
+                if token_base + token < work.valid_tokens_in_cta_tile:
+                    store_staged_vector(
+                        staging,
+                        offset,
+                        mask,
+                        address,
+                        work.tile_m_idx * Int32(self.config.cta_tile_features)
+                        + feature,
+                    )
+            # Protect the shared tile from the next token group (or FC1 tile).
+            if cutlass.const_expr(mode == "staged64"):
+                cute.arch.sync_warp()
+            else:
+                boundary.arrive_and_wait()
 
     @cute.jit
     def _run_fc2_token_group(
@@ -817,43 +922,59 @@ class PersistentMxfp8Mxfp4Epilogue:
         acc_stage,
         route_store: Fc2RouteStore,
         token_metadata,
+        epilogue_exchange,
+        boundary,
         warp_idx,
         lane_idx,
     ) -> None:
         """One 32-token FC2 group: load, transpose, store route terms."""
 
-        feature_major = self._load_native_feature_group(
-            tmem_acc_tensor, warp_idx, Int32(token_group), acc_stage
-        )
-        token_major = self._transpose_to_token_major(feature_major, lane_idx)
-        token_offset = Int32(token_group * WARP_SIZE) + lane_idx
-        if token_offset < work.valid_tokens_in_cta_tile:
-            pool_token = (
-                work.cumulative_data_physical_row
-                + work.tile_n_idx * Int32(self.config.cta_tile_tokens)
-                + token_offset
-            )
-            source_rank = Int32(0)
-            source_token = pool_token
-            source_topk = Int32(0)
-            if cutlass.const_expr(token_metadata is not None):
-                source_rank, source_token, source_topk = _load_route_metadata(
-                    token_metadata, pool_token
-                )
-            feature_warp_idx = warp_idx
-            if cutlass.const_expr(self.config.epilogue_warps == 8):
-                feature_warp_idx = warp_idx % Int32(4)
-            hidden_col_start = work.tile_m_idx * Int32(
-                self.config.cta_tile_features
-            ) + feature_warp_idx * Int32(FC2_EPILOGUE_TILE)
-            self.fc2_subtile.store_rmem_subtile(
-                token_major,
+        if cutlass.const_expr(self.config.fc2_store_mode != "direct"):
+            self._run_fc2_staged_group(
+                work,
+                token_group,
+                tmem_acc_tensor,
+                acc_stage,
                 route_store,
-                source_rank,
-                source_token,
-                source_topk,
-                hidden_col_start,
+                token_metadata,
+                epilogue_exchange,
+                boundary,
+                warp_idx,
+                lane_idx,
             )
+        else:
+            feature_major = self._load_native_feature_group(
+                tmem_acc_tensor, warp_idx, Int32(token_group), acc_stage
+            )
+            token_major = self._transpose_to_token_major(feature_major, lane_idx)
+            token_offset = Int32(token_group * WARP_SIZE) + lane_idx
+            if token_offset < work.valid_tokens_in_cta_tile:
+                pool_token = (
+                    work.cumulative_data_physical_row
+                    + work.tile_n_idx * Int32(self.config.cta_tile_tokens)
+                    + token_offset
+                )
+                source_rank = Int32(0)
+                source_token = pool_token
+                source_topk = Int32(0)
+                if cutlass.const_expr(token_metadata is not None):
+                    source_rank, source_token, source_topk = _load_route_metadata(
+                        token_metadata, pool_token
+                    )
+                feature_warp_idx = warp_idx
+                if cutlass.const_expr(self.config.epilogue_warps == 8):
+                    feature_warp_idx = warp_idx % Int32(4)
+                hidden_col_start = work.tile_m_idx * Int32(
+                    self.config.cta_tile_features
+                ) + feature_warp_idx * Int32(FC2_EPILOGUE_TILE)
+                self.fc2_subtile.store_rmem_subtile(
+                    token_major,
+                    route_store,
+                    source_rank,
+                    source_token,
+                    source_topk,
+                    hidden_col_start,
+                )
 
     @cute.jit
     def run(
@@ -954,6 +1075,8 @@ class PersistentMxfp8Mxfp4Epilogue:
                     acc_stage=acc_stage,
                     route_store=route_store,
                     token_metadata=token_metadata,
+                    epilogue_exchange=epilogue_exchange,
+                    boundary=exchange_boundary,
                     warp_idx=warp_idx,
                     lane_idx=lane_idx,
                     warpgroup_idx=warpgroup_idx,

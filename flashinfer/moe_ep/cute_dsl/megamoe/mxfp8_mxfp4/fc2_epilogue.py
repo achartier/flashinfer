@@ -13,9 +13,9 @@ The two operations in this module deliberately have separate interfaces:
 
 In particular, the route-store path has no routing-score operand.  This keeps
 routing after FC2 and prevents it from changing the FC1-to-FC2 MXFP8
-quantization point.  The default implementation intentionally does not use an
-in-kernel reduction (IKR): local and peer stores share the same route-slot
-layout, followed by the deterministic external reducer.
+quantization point. Local and peer stores share the same route-slot layout.
+Reduction placement is selected by the integrating kernel's tactic; the
+persistent tail's pipelined implementation lives in :mod:`combine`.
 
 The integrating kernel owns TMEM lifetime, accumulator-pipeline barriers,
 source metadata, and inter-rank completion signalling.  This component only
@@ -328,8 +328,8 @@ class DeterministicTopKReducer:
     def reduce_worker(self, route_terms, route_scores, route_ids, output, worker_idx):
         """Reduce eight hidden values of one token (views from :meth:`views`).
 
-        Shared by the external kernel and the persistent kernel's in-kernel
-        reduction, so both round identically.
+        Shared by the external kernel and the scalar in-kernel diagnostic.
+        The pipelined combine preserves this exact arithmetic order.
         """
 
         token_idx = worker_idx // self.hidden_tiles

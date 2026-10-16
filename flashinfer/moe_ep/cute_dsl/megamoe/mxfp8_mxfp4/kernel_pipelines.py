@@ -34,12 +34,12 @@ from cutlass.cute.nvgpu import tcgen05
 from .device_epilogue import (
     EPILOGUE_WARPS,
     EXCHANGE_BARRIER_IDS,
-    EXCHANGE_WORDS,
     PersistentMxfp8Mxfp4Epilogue,
 )
 from .device_scheduler import DeviceSchedulerParams, PersistentDeviceScheduler
 from .dispatch import Mxfp8DispatchPhase
 from .fc1_store import fc1_store_bytes, fc1_store_layout
+from .fc2_store import fc2_exchange_words
 from .scale_tma_staging import Mxfp8Mxfp4TmaStaging
 from .stage_fit import MX_BLOCK_SIZE, OperandStageBytes, StageFit
 
@@ -275,6 +275,7 @@ class KernelPipelines:
                 scheduler_params=self.scheduler_params,
                 dispatch_phase=self.dispatch_phase,
                 epilogue_warps=len(self.warp_ids.epilogue),
+                fc2_store_mode=self.epilogue.config.fc2_store_mode,
             )
         return self._shared_storage_type
 
@@ -286,6 +287,7 @@ class KernelPipelines:
         scheduler_params: Any,
         dispatch_phase: Optional[Mxfp8DispatchPhase],
         epilogue_warps: int = EPILOGUE_WARPS,
+        fc2_store_mode: str = "direct",
     ) -> type:
         """Compose the control-storage struct for a given operand stage count.
 
@@ -302,7 +304,8 @@ class KernelPipelines:
         num_acc_barriers = num_acc_stages * 2
         if epilogue_warps not in (4, 8):
             raise ValueError("epilogue_warps must be 4 or 8")
-        exchange_words = EXCHANGE_WORDS * (epilogue_warps // EPILOGUE_WARPS)
+        exchange_words = fc2_exchange_words(epilogue_warps, fc2_store_mode)
+        exchange_alignment = 4 if fc2_store_mode == "direct" else 16
 
         if dispatch_phase is None:
 
@@ -311,7 +314,10 @@ class KernelPipelines:
                 ab_full_mbar: cute.struct.MemRange[cutlass.Int64, num_operand_barriers]
                 acc_full_mbar: cute.struct.MemRange[cutlass.Int64, num_acc_barriers]
                 scheduler: SchedulerStorage  # type: ignore[valid-type]
-                epilogue_exchange: cute.struct.MemRange[cutlass.Float32, exchange_words]
+                epilogue_exchange: cute.struct.Align[
+                    cute.struct.MemRange[cutlass.Float32, exchange_words],
+                    exchange_alignment,
+                ]
                 tmem_dealloc_mbar: cutlass.Int64
                 tmem_holding_buf: cutlass.Int32
 
@@ -325,7 +331,10 @@ class KernelPipelines:
             acc_full_mbar: cute.struct.MemRange[cutlass.Int64, num_acc_barriers]
             scheduler: SchedulerStorage  # type: ignore[valid-type]
             dispatch: DispatchStorage  # type: ignore[valid-type]
-            epilogue_exchange: cute.struct.MemRange[cutlass.Float32, exchange_words]
+            epilogue_exchange: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float32, exchange_words],
+                exchange_alignment,
+            ]
             tmem_dealloc_mbar: cutlass.Int64
             tmem_holding_buf: cutlass.Int32
 
@@ -523,6 +532,7 @@ def fit_operand_stages(
     minimum_stages: int = 2,
     maximum_stages: int = 8,
     epilogue_warps: int = EPILOGUE_WARPS,
+    fc2_store_mode: str = "direct",
 ) -> StageFit:
     """Deepest operand pipeline whose dynamic shared memory fits one CTA.
 
@@ -537,6 +547,7 @@ def fit_operand_stages(
             scheduler_params=scheduler_params,
             dispatch_phase=dispatch_phase,
             epilogue_warps=epilogue_warps,
+            fc2_store_mode=fc2_store_mode,
         )
         fixed = -(-storage.__sizeof__() // _OPERAND_SMEM_ALIGNMENT) * (
             _OPERAND_SMEM_ALIGNMENT

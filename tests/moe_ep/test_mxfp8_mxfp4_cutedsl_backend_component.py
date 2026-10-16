@@ -130,10 +130,13 @@ def test_in_kernel_reduce_rejects_non_boolean_tactic(value) -> None:
 def test_pair_tile_candidates_cover_every_default() -> None:
     shape = dict(hidden=4096, intermediate=6400)
     candidates = candidate_tactics(**shape)
-    assert len(candidates) == 28
+    assert len(candidates) == 32
     alternating = [c for c in candidates if c["load_balance_mode"] == "alternating"]
     assert len(alternating) == 4
     assert {c["mma_tiler_mnk"] for c in alternating} == {(256, 192, 128)}
+    atomic = [c for c in candidates if c["load_balance_mode"] == "atomic_counter"]
+    assert len(atomic) == 4
+    assert {c["mma_tiler_mnk"] for c in atomic} == {(256, 64, 128)}
     assert {c["mma_tiler_mnk"] for c in candidates} == {
         (256, 64, 128),
         (256, 128, 128),
@@ -173,18 +176,24 @@ def test_tune_cli_dispatches_mxfp8_mxfp4_and_schedule_candidates_validate() -> N
         validate_tactic(candidate, partial=False)
 
 
-def test_alternating_claims_default_band_env_and_overrides(monkeypatch) -> None:
+def test_claim_mode_default_bands_env_and_overrides(monkeypatch) -> None:
     from flashinfer.moe_ep.backends.mega.kernel.sm100.mxfp8_mxfp4_bf16_cutedsl.config import (
         ALTERNATING_CLAIM_TOKENS,
+        ATOMIC_CLAIM_MAX_TOKENS,
         LOAD_BALANCE_MODE_ENV,
     )
 
     monkeypatch.delenv(LOAD_BALANCE_MODE_ENV, raising=False)
     shape = dict(hidden=4096, intermediate=6400)
     assert ALTERNATING_CLAIM_TOKENS == (512, 1024)
-    # The pair tile alternates claims in the N192 band only.
+    assert ATOMIC_CLAIM_MAX_TOKENS == 256
+    # The pair tile claims atomically below 256 tokens per rank and
+    # alternates FC1/FC2 claims in the N192 band.
     for tokens, mode in (
-        (64, "static"),
+        (1, "atomic_counter"),
+        (64, "atomic_counter"),
+        (255, "atomic_counter"),
+        (256, "static"),
         (511, "static"),
         (512, "alternating"),
         (1023, "alternating"),
@@ -195,6 +204,7 @@ def test_alternating_claims_default_band_env_and_overrides(monkeypatch) -> None:
         assert tactic["load_balance_mode"] == mode
         assert (tactic["mma_tiler_mnk"][1] == 192) == (mode == "alternating")
     # 1-CTA tiles keep static claims.
+    assert default_tactic(64)["load_balance_mode"] == "static"
     assert default_tactic(512)["load_balance_mode"] == "static"
     assert default_tactic(512, hidden=6528, intermediate=4096)["load_balance_mode"] == (
         "static"
@@ -413,3 +423,126 @@ def test_weight_validation_rejects_non_bf16_and_wrong_e8m0_contract() -> None:
             intermediate_size=128,
             hidden_size=128,
         )
+
+
+def test_dispatch_dedup_default_env_and_override(monkeypatch):
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.mxfp8_mxfp4_bf16_cutedsl.config import (
+        DISPATCH_DEDUP_ENV,
+        resolve_tactic,
+    )
+
+    monkeypatch.delenv(DISPATCH_DEDUP_ENV, raising=False)
+    assert default_tactic(1024)["dispatch_dedup"] is False
+    monkeypatch.setenv(DISPATCH_DEDUP_ENV, "1")
+    assert default_tactic(1024)["dispatch_dedup"] is True
+    assert resolve_tactic(1024, {"dispatch_dedup": False})["dispatch_dedup"] is False
+    monkeypatch.setenv(DISPATCH_DEDUP_ENV, "true")
+    with pytest.raises(ValueError, match=DISPATCH_DEDUP_ENV):
+        default_tactic(1024)
+    for value in (0, 1, "true", None):
+        with pytest.raises(ValueError, match="dispatch_dedup must be a bool"):
+            validate_tactic({"dispatch_dedup": value})
+
+
+@pytest.mark.parametrize("mode", ["direct", "staged64", "staged256"])
+def test_fc2_store_mode_resolution(mode, monkeypatch):
+    name = "FLASHINFER_MXFP8_MXFP4_FC2_STORE_MODE"
+    monkeypatch.delenv(name, raising=False)
+    assert default_tactic(256)["fc2_store_mode"] == "staged256"
+    monkeypatch.setenv(name, mode)
+    assert default_tactic(256)["fc2_store_mode"] == mode
+    assert (
+        resolve_tactic(256, {"fc2_store_mode": "direct"})["fc2_store_mode"] == "direct"
+    )
+    monkeypatch.setenv(name, "invalid")
+    with pytest.raises(ValueError, match="FC2_STORE_MODE"):
+        default_tactic(256)
+    with pytest.raises(ValueError, match="fc2_store_mode"):
+        validate_tactic({"fc2_store_mode": "invalid"})
+
+
+@pytest.mark.parametrize("value", [-1, 4, True, 1.5, "2", None])
+def test_startup_prefetch_rejects_invalid_waves(value):
+    with pytest.raises(ValueError, match="startup_prefetch_waves"):
+        validate_tactic({"startup_prefetch_waves": value})
+
+
+def test_startup_prefetch_environment_and_override(monkeypatch):
+    name = "FLASHINFER_MXFP8_MXFP4_STARTUP_PREFETCH_WAVES"
+    monkeypatch.delenv(name, raising=False)
+    assert default_tactic(64)["startup_prefetch_waves"] == 0
+    monkeypatch.setenv(name, "2")
+    assert default_tactic(64)["startup_prefetch_waves"] == 2
+    assert (
+        resolve_tactic(64, {"startup_prefetch_waves": 0})["startup_prefetch_waves"] == 0
+    )
+    monkeypatch.setenv(name, "4")
+    with pytest.raises(ValueError, match=name):
+        default_tactic(64)
+
+
+@pytest.mark.parametrize(
+    "tile,cluster", [((128, 64, 128), (2, 1, 1)), ((128, 64, 128), (1, 2, 1))]
+)
+def test_startup_prefetch_rejects_unsupported_cluster(tile, cluster):
+    with pytest.raises(ValueError, match="startup prefetch"):
+        resolve_tactic(
+            64,
+            {
+                "startup_prefetch_waves": 2,
+                "mma_tiler_mnk": tile,
+                "cluster_shape_mnk": cluster,
+            },
+        )
+
+
+@pytest.mark.parametrize("mma_m,clusters", [(128, 148), (256, 74)])
+@pytest.mark.parametrize("requested", [0, 1, 2, 3])
+def test_startup_prefetch_l2_budget(mma_m, clusters, requested):
+    from flashinfer.moe_ep.cute_dsl.megamoe.mxfp8_mxfp4.startup_prefetch import (
+        plan_startup_prefetch,
+    )
+
+    plan = plan_startup_prefetch(
+        requested,
+        hidden=4096,
+        intermediate=6400,
+        experts=32,
+        mma_m=mma_m,
+        clusters=clusters,
+        l2_bytes=126 * 1024**2,
+    )
+    assert plan.bytes_per_wave == 148 * (256 + 16) * 1024
+    assert plan.waves == min(requested, 2)
+    assert plan.waves * plan.bytes_per_wave <= plan.budget_bytes
+    assert plan.budget_bytes == plan.l2_bytes * 4 // 5
+
+
+def test_startup_prefetch_small_prefix_and_no_capacity():
+    from flashinfer.moe_ep.cute_dsl.megamoe.mxfp8_mxfp4.startup_prefetch import (
+        plan_startup_prefetch,
+    )
+
+    args = dict(hidden=256, intermediate=256, experts=2, mma_m=256, clusters=74)
+    plan = plan_startup_prefetch(3, **args, l2_bytes=126 * 1024**2)
+    assert plan.waves == 1  # Never reissue beyond the unique weight prefix.
+    assert plan.bytes_per_wave == 2 * 512 * (128 + 8)
+    assert plan_startup_prefetch(3, **args, l2_bytes=0).waves == 0
+
+
+@pytest.mark.parametrize("value", [0, 1, None, "true"])
+def test_vector_count_publish_requires_bool(value):
+    with pytest.raises(ValueError, match="vector_count_publish"):
+        validate_tactic({"vector_count_publish": value})
+
+
+@pytest.mark.parametrize("key", ["cta_local_counts", "overlap_dispatch_pull"])
+@pytest.mark.parametrize("value", [1, 0, "yes", None])
+def test_startup_fixes_require_bool(key, value):
+    with pytest.raises(ValueError, match=key):
+        validate_tactic({key: value})
+
+
+def test_overlap_pull_rejects_dedup():
+    with pytest.raises(ValueError, match="dispatch_dedup"):
+        validate_tactic({"overlap_dispatch_pull": True, "dispatch_dedup": True})

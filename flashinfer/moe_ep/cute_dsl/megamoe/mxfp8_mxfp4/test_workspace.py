@@ -64,6 +64,8 @@ def test_counter_prefixes_end_at_first_data_region(mode, count) -> None:
     )
     assert plan.local.zero_prefix_i32_count * 4 == plan.local.zero_prefix_bytes
     assert plan.shared.zero_prefix_i32_count * 4 == plan.shared.zero_prefix_bytes
+    for name in ("grid_sync_counter", "nvlink_barrier_counter"):
+        assert plan.local.region(name).offset >= plan.local.zero_prefix_bytes
 
     for layout in (plan.local, plan.shared):
         assert layout.total_bytes % 16 == 0
@@ -151,3 +153,23 @@ def test_token_back_counter_and_publish_sizing() -> None:
 def test_rejects_non_atom_aligned_sf_padding() -> None:
     with pytest.raises(ValueError, match="multiple of 128"):
         _config(sf_padding_block=224)
+
+
+def test_dispatch_dedup_workspace_is_optional_and_outside_reset_prefix():
+    baseline = make_workspace_plan(_config())
+    plan = make_workspace_plan(_config(dispatch_dedup=True))
+    with pytest.raises(KeyError):
+        baseline.shared.region("src_sibling_idx")
+    sibling = plan.shared.region("src_sibling_idx")
+    source = plan.shared.region("src_token_topk_idx")
+    assert sibling.spec.shape == source.spec.shape
+    assert sibling.offset >= plan.shared.zero_prefix_bytes
+    assert plan.local == baseline.local
+    # Linear links support slots above 65535 without truncation.
+    large = _config(dispatch_dedup=True, max_tokens_per_rank=32768)
+    assert (
+        make_workspace_plan(large).shared.region("src_sibling_idx").spec.shape[-1]
+        == 131072
+    )
+    with pytest.raises(ValueError, match="sibling indices"):
+        _config(dispatch_dedup=True, max_tokens_per_rank=2**28)

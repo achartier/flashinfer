@@ -79,10 +79,43 @@ class Slot(IntEnum):
     DISPATCH_SYNC_SEND_NS = 37
     DISPATCH_NVLINK_BARRIER_NS = 38
     SCHED_LATE_CLAIM_NS = 39
+    DISPATCH_FETCH_COUNT = 40
+    TAIL_DRAIN_BARRIER_NS = 41
+    TAIL_SHARED_RESET_NS = 42
+    TAIL_PUBLISH_BARRIER_NS = 43
+    TAIL_LOCAL_RESET_NS = 44
+    # Unlike KERNEL_TAIL_NS (scheduler warp), this includes the cross-rank
+    # drain even when the reduction is external and the scheduler exits early.
+    # It also includes dispatch waiting for compute at the initial rendezvous;
+    # the individual barrier slots isolate cleanup from that arrival skew.
+    TAIL_DISPATCH_NS = 45
+    # Startup subphases. Rendezvous is meaningful on CTA 0 (other CTAs
+    # return immediately and wait in the closing grid synchronization).
+    DISPATCH_GRID_SYNC_NS = 46
+    DISPATCH_COUNT_SEND_NS = 47
+    DISPATCH_RENDEZVOUS_NS = 48
+    DISPATCH_COUNT_SUM_NS = 49
+    TMA_A_STARTUP_PREFETCH_NS = 50
+    # Round-7 start-up split of the NVLink barrier (mega only). CTA 0 alone:
+    # dispatch-prep start to its cross-rank signal send (prep, first grid
+    # sync, count sends), and the spin from the send until every rank has
+    # signalled (arrival skew plus one NVLink round trip). Every CTA: from
+    # the end of the signal exchange to the end of the dispatch barrier (CTA
+    # 0's owner-side count publication and the closing grid sync; on other
+    # CTAs this includes waiting for CTA 0's signal).
+    STARTUP_LOCAL_ARRIVAL_AT_NS = 51
+    STARTUP_SIGNAL_WAIT_NS = 52
+    STARTUP_GRID_SYNC_NS = 53
 
 
-SLOTS = 40
+SLOTS = 54
 STATS_WORDS = MAX_CTAS * SLOTS
+# Mega only: a per-launch ring after the per-CTA block. Word 0 counts
+# launches; entry i (words 1 + 3 i ...) holds (launch number + 1, local
+# arrival ns, signal wait ns) of CTA 0, launch number modulo the ring size.
+STARTUP_RING_ENTRIES = 512
+STARTUP_RING_WORDS = 1 + 3 * STARTUP_RING_ENTRIES
+MEGA_STATS_WORDS = STATS_WORDS + STARTUP_RING_WORDS
 
 
 def wait_stats_enabled() -> bool:
@@ -101,12 +134,39 @@ def mega_stats_word_offset(plan) -> Optional[int]:
 
 
 def read_mega_wait_stats(workspace):
-    """The mega ``wait_stats`` region of a workspace as an int32 tensor view."""
+    """The mega per-CTA ``wait_stats`` block (``STATS_WORDS``) as an int32 view."""
 
     region = workspace.plan.local.region("wait_stats")
     import torch
 
-    return workspace.workspace_bytes[region.offset : region.end].view(torch.int32)
+    words = workspace.workspace_bytes[region.offset : region.end].view(torch.int32)
+    return words[:STATS_WORDS]
+
+
+def read_mega_startup_ring(workspace):
+    """The mega per-launch start-up ring (``STARTUP_RING_WORDS``) as an int32 view."""
+
+    region = workspace.plan.local.region("wait_stats")
+    import torch
+
+    words = workspace.workspace_bytes[region.offset : region.end].view(torch.int32)
+    return words[STATS_WORDS:MEGA_STATS_WORDS]
+
+
+def decode_startup_ring(ring) -> list[dict]:
+    """Recorded ring entries in launch order: launch, arrival and wait in µs."""
+
+    entries = ring[1:].reshape(STARTUP_RING_ENTRIES, 3).tolist()
+    rows = [
+        {
+            "launch": launch - 1,
+            "local_arrival_us": round(arrival / 1000, 2),
+            "signal_wait_us": round(wait / 1000, 2),
+        }
+        for launch, arrival, wait in entries
+        if launch > 0
+    ]
+    return sorted(rows, key=lambda row: row["launch"])
 
 
 def summarize(stats, num_ctas: int) -> dict:
@@ -131,11 +191,16 @@ def summarize(stats, num_ctas: int) -> dict:
 
 __all__ = [
     "MAX_CTAS",
+    "MEGA_STATS_WORDS",
     "SLOTS",
+    "STARTUP_RING_ENTRIES",
+    "STARTUP_RING_WORDS",
     "STATS_WORDS",
     "Slot",
     "WAIT_STATS_ENV",
     "mega_stats_word_offset",
+    "decode_startup_ring",
+    "read_mega_startup_ring",
     "read_mega_wait_stats",
     "summarize",
     "wait_stats_enabled",

@@ -74,6 +74,39 @@ def test_pipeline_contract_is_m128_or_m256_block32() -> None:
     assert KernelWarpIds().threads_per_cta == 12 * 32
 
 
+@pytest.mark.parametrize("mode", ["direct", "staged64", "staged256"])
+@pytest.mark.parametrize("warps", [4, 8])
+@pytest.mark.parametrize("n", [64, 128, 192])
+def test_fc2_staging_stage_fit(mode, warps, n):
+    kwargs = dict(
+        mma_tiler_mnk=(256, n, 128),
+        scheduler_params=SimpleNamespace(num_stages=2, load_balance_mode="static"),
+        dispatch_phase=_ep16_dispatch(4096),
+        epilogue_warps=warps,
+        smem_capacity_bytes=SM100_SMEM_CAPACITY,
+        maximum_stages=12,
+    )
+    fit = fit_operand_stages(**kwargs, fc2_store_mode=mode)
+    storage = KernelPipelines.build_shared_storage_type(
+        num_ab_stages=fit.stages,
+        num_acc_stages=2,
+        scheduler_params=kwargs["scheduler_params"],
+        dispatch_phase=kwargs["dispatch_phase"],
+        epilogue_warps=warps,
+        fc2_store_mode=mode,
+    )
+    assert fit.fixed_bytes == (storage.__sizeof__() + 127) // 128 * 128
+    assert fit.used_bytes <= SM100_SMEM_CAPACITY
+    baseline = fit_operand_stages(**kwargs)
+    assert fit.stages <= baseline.stages
+    if mode != "direct":
+        assert fit.fixed_bytes >= warps * 1024
+    if mode != "direct" and n == 128:
+        # The two 16-row chunks preserve this N128 fixture's stage depth;
+        # a full 32-row buffer costs one operand stage with eight warps.
+        assert fit.stages == baseline.stages
+
+
 @pytest.mark.parametrize("mega", [False, True])
 @pytest.mark.parametrize("warps", [4, 8])
 def test_epilogue_warpgroup_roles(mega, warps) -> None:
@@ -310,3 +343,42 @@ def test_b200_stage_fit_boundary_matches_launch_limit() -> None:
     with pytest.raises(Exception, match="(?i)shared memory|CUDA_ERROR_INVALID_VALUE"):
         cute.compile(_StageFitLaunchHarness(fitted + 1, 6400), stream)(stream)
         torch.cuda.synchronize()
+
+
+@pytest.mark.parametrize("hidden", [4096, 6400])
+@pytest.mark.parametrize("warps", [4, 8])
+@pytest.mark.parametrize("n", [64, 128, 192])
+def test_dispatch_dedup_keeps_operand_stage_budget(hidden, warps, n):
+    fits = []
+    for enabled in (False, True):
+        workspace = WorkspaceConfig(
+            world_size=16,
+            num_topk=8,
+            num_experts_per_rank=32,
+            max_tokens_per_rank=1024,
+            hidden=hidden,
+            intermediate=6400,
+            token_padding_block=64,
+            sf_padding_block=128,
+            cluster_tile_tokens=n,
+            dispatch_dedup=enabled,
+        )
+        dispatch = Mxfp8DispatchPhase(
+            workspace,
+            cluster_shape_mn=(2, 1),
+            dispatch_warp_start=8,
+            num_other_warps=warps + 4,
+        )
+        fits.append(
+            fit_operand_stages(
+                mma_tiler_mnk=(256, n, 128),
+                scheduler_params=SimpleNamespace(
+                    num_stages=2, load_balance_mode="static"
+                ),
+                dispatch_phase=dispatch,
+                epilogue_warps=warps,
+                smem_capacity_bytes=SM100_SMEM_CAPACITY,
+                maximum_stages=12,
+            )
+        )
+    assert fits[0] == fits[1]
