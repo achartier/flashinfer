@@ -5,6 +5,7 @@
 Use an external process timeout: a broken persistent synchronization protocol
 cannot be safely interrupted by a Python exception on the submitting thread.
 This is correctness validation, not a performance benchmark or an IB test.
+Use --allow-single-rank for EP1 relaunch diagnostics without peer coverage.
 
 All-output model-width regression (four tokens per rank, not sampled):
     timeout 300s torchrun --standalone --nproc-per-node=2 \
@@ -18,6 +19,7 @@ import json
 import os
 import faulthandler
 import traceback
+import time
 
 import torch
 import torch.distributed as dist
@@ -46,6 +48,23 @@ def main():
     parser.add_argument("--top-k", type=int, default=2)
     parser.add_argument("--tokens-per-rank", type=int, default=7)
     parser.add_argument("--bounded-reference", action="store_true")
+    parser.add_argument("--repeat", type=int, default=3)
+    parser.add_argument(
+        "--allow-single-rank",
+        action="store_true",
+        help="Allow EP1 relaunch diagnostics; does not validate peer traffic or rank skew.",
+    )
+    parser.add_argument(
+        "--rank-skew-us",
+        type=int,
+        default=0,
+        help="Rotate a host-side delay across ranks before each eager/replay launch.",
+    )
+    parser.add_argument(
+        "--random-routing",
+        action="store_true",
+        help="Use unsorted unique random experts instead of the remote-owner stress pattern.",
+    )
     parser.add_argument(
         "--num-stages",
         type=int,
@@ -72,6 +91,8 @@ def main():
             parser.error(f"{name} must be a positive multiple of 128")
     if args.tokens_per_rank <= 0 or args.top_k <= 0:
         parser.error("tokens-per-rank and top-k must be positive")
+    if args.repeat <= 0 or args.rank_skew_us < 0:
+        parser.error("repeat must be positive and rank-skew-us non-negative")
     faulthandler.dump_traceback_later(120)
     from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.comm import (
         bootstrap_dist,
@@ -92,7 +113,7 @@ def main():
     )
 
     _, rank, world, _ = bootstrap_dist()
-    if world < 2:
+    if world < 2 and not args.allow_single_rank:
         raise ValueError("this gate requires at least two ranks")
     tokens, hidden, intermediate, topk = (
         args.tokens_per_rank,
@@ -138,6 +159,14 @@ def main():
             ids[source, :, slot] = (
                 ((source + 1) % world) * local_experts + slot
             ) % experts
+    if args.random_routing:
+        if topk > experts:
+            raise ValueError("random routing requires top-k <= experts")
+        ids = (
+            torch.rand((world, tokens, experts), device="cuda", generator=gen)
+            .argsort(dim=-1)[..., :topk]
+            .contiguous()
+        )
     ids[:, -1, -1] = -1
     scores = random((world, tokens, topk))
     local = slice(rank * local_experts, (rank + 1) * local_experts)
@@ -209,7 +238,8 @@ def main():
 
     saved = {}
     try:
-        for scenario in ("cross_peer", "empty_source", "restored_routes"):
+        first_scenario = "local_only" if world == 1 else "cross_peer"
+        for scenario in (first_scenario, "empty_source", "restored_routes"):
             active_tokens = 0 if scenario == "empty_source" and rank == 0 else tokens
             routes = ids.clone()
             if scenario == "empty_source":
@@ -217,11 +247,17 @@ def main():
             workspace.topk_idx.copy_(routes[rank])
             expected = oracle(routes)[rank, :active_tokens]
             print(f"rank={rank} scenario={scenario} eager begin", flush=True)
-            for _ in range(3):
+            baseline = None
+            for iteration in range(args.repeat):
+                if args.rank_skew_us and rank == iteration % world:
+                    time.sleep(args.rank_skew_us / 1e6)
                 actual = launch()
                 torch.cuda.synchronize()
                 torch.testing.assert_close(actual, expected, atol=0.015, rtol=0.05)
-            baseline = actual.clone()
+                if baseline is None:
+                    baseline = actual.clone()
+                else:
+                    torch.testing.assert_close(actual, baseline, atol=0, rtol=0)
             saved[scenario] = baseline.cpu()
             torch.cuda.synchronize()
             dist.barrier()
@@ -234,7 +270,9 @@ def main():
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph, stream=capture_stream):
                 actual = launch()
-            for _ in range(3):
+            for iteration in range(args.repeat):
+                if args.rank_skew_us and rank == iteration % world:
+                    time.sleep(args.rank_skew_us / 1e6)
                 graph.replay()
                 torch.cuda.synchronize()
                 torch.testing.assert_close(actual, baseline, atol=0, rtol=0)

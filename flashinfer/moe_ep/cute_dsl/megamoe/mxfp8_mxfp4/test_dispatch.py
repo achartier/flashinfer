@@ -13,9 +13,10 @@ from .dispatch import SingleRankMxfp8Dispatch
 from .workspace import WorkspaceConfig, make_workspace_plan
 
 
-def _config() -> WorkspaceConfig:
+def _config(dispatch_dedup=False) -> WorkspaceConfig:
     return WorkspaceConfig(
         world_size=1,
+        dispatch_dedup=dispatch_dedup,
         num_topk=2,
         num_experts_per_rank=4,
         max_tokens_per_rank=8,
@@ -33,12 +34,26 @@ def _metadata(token: int, topk: int) -> int:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("num_sms", [1, 4])
-def test_single_rank_dispatch_compacts_mxfp8_routes_on_device(num_sms) -> None:
+@pytest.mark.parametrize(
+    "dispatch_dedup,local_counts,overlap",
+    [
+        (False, False, False),
+        (True, False, False),
+        (False, True, False),
+        (False, False, True),
+        (False, True, True),
+        (True, True, False),
+    ],
+)
+def test_single_rank_dispatch_compacts_mxfp8_routes_on_device(
+    num_sms, dispatch_dedup, local_counts, overlap, monkeypatch
+) -> None:
     major, _ = torch.cuda.get_device_capability()
     if major != 10:
         pytest.skip("requires an SM100-class B200")
 
-    config = _config()
+    monkeypatch.setenv("FLASHINFER_MXFP8_MXFP4_WAIT_STATS", "1")
+    config = _config(dispatch_dedup)
     plan = make_workspace_plan(config)
     device = torch.device("cuda")
     local_bytes = torch.zeros(plan.local.total_bytes, dtype=torch.uint8, device=device)
@@ -96,7 +111,12 @@ def test_single_rank_dispatch_compacts_mxfp8_routes_on_device(num_sms) -> None:
     # launch() issues on the stream bound at compile time, so the graph below
     # must capture that same stream.
     stream = torch.cuda.Stream()
-    products = SingleRankMxfp8Dispatch(config, num_sms=num_sms).compile(
+    products = SingleRankMxfp8Dispatch(
+        config,
+        num_sms=num_sms,
+        cta_local_counts=local_counts,
+        overlap_dispatch_pull=overlap,
+    ).compile(
         partition,
         activation,
         scales,
@@ -106,6 +126,14 @@ def test_single_rank_dispatch_compacts_mxfp8_routes_on_device(num_sms) -> None:
     )
     products()
     torch.cuda.synchronize()
+
+    if dispatch_dedup:
+        from .wait_stats_config import SLOTS, STATS_WORDS, Slot
+
+        fetched = partition.local["wait_stats"][:STATS_WORDS].reshape(-1, SLOTS)[
+            :, Slot.DISPATCH_FETCH_COUNT
+        ]
+        assert fetched.sum().item() == 4
 
     # Pool rows are expert-major; within an expert the stable order is the
     # original (token, top-k slot) scan order.  Expert 3 is empty.
@@ -173,8 +201,73 @@ def test_single_rank_dispatch_compacts_mxfp8_routes_on_device(num_sms) -> None:
         )
 
 
+def test_startup_ring_layout_and_decode() -> None:
+    from .wait_stats_config import (
+        MEGA_STATS_WORDS,
+        STARTUP_RING_ENTRIES,
+        STARTUP_RING_WORDS,
+        STATS_WORDS,
+        decode_startup_ring,
+    )
+
+    assert MEGA_STATS_WORDS == STATS_WORDS + 1 + 3 * STARTUP_RING_ENTRIES
+    ring = torch.zeros(STARTUP_RING_WORDS, dtype=torch.int32)
+    # Device layout: word 0 counts launches; entry i holds (launch + 1,
+    # arrival ns, wait ns) of launch i modulo the ring size.
+    ring[0] = 3
+    for launch, arrival, wait in ((2, 9000, 1500), (0, 7000, 2500), (1, 8000, 500)):
+        ring[1 + 3 * launch : 4 + 3 * launch] = torch.tensor(
+            [launch + 1, arrival, wait]
+        )
+    rows = decode_startup_ring(ring)
+    assert [row["launch"] for row in rows] == [0, 1, 2]
+    assert rows[0] == {"launch": 0, "local_arrival_us": 7.0, "signal_wait_us": 2.5}
+
+
 def test_dispatch_rejects_distributed_configuration() -> None:
     config = _config()
     distributed = WorkspaceConfig(**{**config.__dict__, "world_size": 2})
     with pytest.raises(NotImplementedError, match="world_size=1"):
         SingleRankMxfp8Dispatch(distributed)
+
+
+def test_round_robin_inverse_matches_enumeration():
+    import random
+    from .dispatch_dedup import round_robin_slot
+
+    rng = random.Random(1234)
+    for world in (1, 2, 4, 16):
+        for _ in range(100):
+            counts = [rng.randrange(20) for _ in range(world)]
+            order = [
+                (rank, slot)
+                for slot in range(max(counts))
+                for rank, count in enumerate(counts)
+                if slot < count
+            ]
+            for position, (rank, slot) in enumerate(order):
+                assert round_robin_slot(counts, rank, slot) == position
+
+
+@pytest.mark.parametrize(
+    "experts",
+    [
+        [7, 2, 5, 0, 6, 3, 1, 4],
+        [-1, 18, 7, -1, 1, 19, 6, 0],
+        [-1] * 8,
+        [2, 2, 0, -1, 2, 0, 1, 1],
+    ],
+)
+def test_sibling_chains_cover_routes_once(experts):
+    from .dispatch_dedup import sibling_chains
+
+    chains = sibling_chains(experts, 8)
+    assert sorted(k for chain in chains for k in chain) == [
+        k for k, expert in enumerate(experts) if expert >= 0
+    ]
+    assert len(chains) == len({expert // 8 for expert in experts if expert >= 0})
+    for chain in chains:
+        assert len({experts[k] // 8 for k in chain}) == 1
+        assert [(experts[k], k) for k in chain] == sorted(
+            (experts[k], k) for k in chain
+        )

@@ -279,6 +279,7 @@ class PersistentFc12KernelBase:
 
     mega = False
     resolved_num_stages = None
+    startup_prefetch_plan = None
 
     def _fit_operand_stages(
         self,
@@ -287,6 +288,7 @@ class PersistentFc12KernelBase:
         wc,
         local_rank,
         warps,
+        fc2_store_mode,
         cluster_shape_mn,
         load_balance_mode,
         flag_batch,
@@ -322,6 +324,7 @@ class PersistentFc12KernelBase:
             ),
             dispatch_phase=dispatch,
             epilogue_warps=len(warps.epilogue),
+            fc2_store_mode=fc2_store_mode,
             smem_capacity_bytes=cutlass.utils.get_smem_capacity_in_bytes(),
             # 2-CTA stages are smaller per CTA; allow the deeper pipelines
             # they fit (the 1-CTA cap stays at the measured default).
@@ -376,7 +379,15 @@ class PersistentFc12KernelBase:
         m, n, _ = self.tactic["mma_tiler_mnk"]
         cm, cn, _ = self.tactic["cluster_shape_mnk"]
         use_fc1_tma_store = fc1_tma_store_enabled()
+        from ....backends.mega.kernel.sm100.mxfp8_mxfp4_bf16_cutedsl.config import (
+            default_fc2_store_mode,
+        )
+
+        fc2_store_mode = self.tactic.get("fc2_store_mode") or default_fc2_store_mode()
         mega = self.mega
+        vector_count_publish = self.tactic.get("vector_count_publish", False)
+        cta_local_counts = self.tactic.get("cta_local_counts", False)
+        overlap_dispatch_pull = self.tactic.get("overlap_dispatch_pull", False)
         in_kernel_reduce = mega and self.tactic.get("in_kernel_reduce", False)
         # The tactic selects the epilogue width (Mega always resolves one);
         # the lean proxy's fixed tactic has none and follows the environment.
@@ -413,6 +424,33 @@ class PersistentFc12KernelBase:
             else wc.pool_sf_capacity
         )
         cluster_size = cm * cn
+        startup_waves = 0
+        if mega and self.tactic.get("startup_prefetch_waves", 0):
+            from .startup_prefetch import plan_startup_prefetch
+
+            requested_waves = self.tactic.get("startup_prefetch_waves", 0)
+            l2_bytes = torch.cuda.get_device_properties(
+                self.workspace.workspace_bytes.device
+            ).L2_cache_size
+            self.startup_prefetch_plan = plan_startup_prefetch(
+                requested_waves,
+                hidden=config.hidden,
+                intermediate=config.intermediate,
+                experts=config.num_experts,
+                mma_m=m,
+                clusters=max_active_clusters,
+                l2_bytes=l2_bytes,
+            )
+            startup_waves = self.startup_prefetch_plan.waves
+            _logger.info(
+                "MXFP8 x MXFP4 startup prefetch: requested=%d resolved=%d "
+                "bytes_per_wave=%d budget=%d L2=%d",
+                requested_waves,
+                startup_waves,
+                self.startup_prefetch_plan.bytes_per_wave,
+                self.startup_prefetch_plan.budget_bytes,
+                l2_bytes,
+            )
         active_sms = max_active_clusters * cluster_size
         group_hint = self.tactic.get("group_hint") or max_active_clusters
         # Per-CTA feature tile: a 2-CTA (M256) MMA spans two CTAs of 128 rows.
@@ -436,6 +474,7 @@ class PersistentFc12KernelBase:
                 wc=wc,
                 local_rank=local_rank,
                 warps=warps,
+                fc2_store_mode=fc2_store_mode,
                 cluster_shape_mn=(cm, cn),
                 load_balance_mode=load_balance_mode,
                 flag_batch=flag_batch,
@@ -489,14 +528,16 @@ class PersistentFc12KernelBase:
                     dispatch_warp_start=warps.dispatch[0],
                     num_other_warps=len(warps.epilogue) + 4,
                     flag_batch=flag_batch,
+                    vector_count_publish=vector_count_publish,
+                    cta_local_counts=cta_local_counts,
+                    overlap_dispatch_pull=overlap_dispatch_pull,
                 )
-                if cutlass.const_expr(in_kernel_reduce):
-                    dispatch.bind_in_kernel_reduce(route_terms, reduce_output)
             epilogue = PersistentMxfp8Mxfp4Epilogue(
                 DeviceEpilogueConfig(
                     cta_tile_features=cta_m,
                     cta_tile_tokens=n,
                     epilogue_warps=len(warps.epilogue),
+                    fc2_store_mode=fc2_store_mode,
                     gate_up_clamp=gate_up_clamp,
                     fast_math=fast_math,
                 )
@@ -541,6 +582,10 @@ class PersistentFc12KernelBase:
                 warp_ids=warps,
             )
             storage = smem.allocate(pipes.shared_storage_type())
+            if cutlass.const_expr(mega and cta_local_counts):
+                scheduler_params.expert_token_sizes = dispatch.bind_local_counts(
+                    dispatch_args, storage.dispatch
+                )
             epilogue_exchange = cute.make_tensor(
                 storage.epilogue_exchange.data_ptr(),
                 cute.make_layout(
@@ -557,6 +602,16 @@ class PersistentFc12KernelBase:
                 store_smem = pipes.allocate_fc1_store_smem(smem)
                 fc1_store = (fc1_store_atom, fc1_store_tensor, store_smem)
             operands = pipes.allocate_operand_smem(smem)
+            if cutlass.const_expr(in_kernel_reduce):
+                # All operand TMA/UMMA users drain before the tail rendezvous.
+                # Alias their contiguous allocation; do not grow shared memory
+                # or reduce the mainloop's automatically fitted stage count.
+                dispatch.bind_in_kernel_reduce(
+                    route_terms,
+                    reduce_output,
+                    scratch=operands.weight.iterator,
+                    scratch_bytes=num_stages * staging.operand_stage_bytes().total,
+                )
             mainloop = pipes.create_mainloop_pipelines(storage)
             sched = pipes.create_scheduler(
                 storage, block_idx=cute.arch.block_idx(), grid_dim=cute.arch.grid_dim()
@@ -619,7 +674,10 @@ class PersistentFc12KernelBase:
                     )
                 )
             PersistentM128DeviceDriver(
-                kernel_pipelines=pipes, stats_word_offset=stats_word_offset
+                kernel_pipelines=pipes,
+                stats_word_offset=stats_word_offset,
+                startup_prefetch_waves=startup_waves,
+                startup_prefetch_clusters=max_active_clusters,
             )(
                 mainloop_pipelines=mainloop,
                 scheduler_bundle=sched,

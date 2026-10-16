@@ -84,6 +84,8 @@ class PersistentM128DeviceDriver:
         epilogue_registers: int | None = None,
         task_registers: int = 72,
         stats_word_offset=None,
+        startup_prefetch_waves: int = 0,
+        startup_prefetch_clusters: int = 1,
     ) -> None:
         staging = kernel_pipelines.staging
         dispatch_phase = kernel_pipelines.dispatch_phase
@@ -111,6 +113,8 @@ class PersistentM128DeviceDriver:
                 raise ValueError(
                     "warp-group register counts exceed the SM register file"
                 )
+        self.startup_prefetch_waves = startup_prefetch_waves
+        self.startup_prefetch_clusters = startup_prefetch_clusters
         self.two_cta = two_cta
         self.kernel_pipelines = kernel_pipelines
         self.staging = staging
@@ -178,6 +182,66 @@ class PersistentM128DeviceDriver:
         if cutlass.const_expr(stats is not None):
             if cute.arch.lane_idx() == Int32(0):
                 stat_add(stats_slot_ptr(stats, slot, self.stats_word_offset), value)
+
+    @staticmethod
+    @cute.jit
+    def _prefetch_tma(atom, source, descriptor_ptr) -> None:
+        """TMA L2 prefetch of one k-tile, honoring a rewritten descriptor."""
+
+        if cutlass.const_expr(descriptor_ptr is None):
+            cute.prefetch(atom, source)
+        else:
+            # cute.prefetch has no tma_desc_ptr argument; unpack the atom the
+            # same way cute.copy does for a rewritten descriptor.
+            from cutlass._mlir.dialects import cute as _cute_ir
+
+            value = atom._unpack(
+                tma_bar_ptr=cute.make_ptr(cutlass.Int64, 0, cute.AddressSpace.smem),
+                tma_desc_ptr=descriptor_ptr,
+                mcast_mask=cutlass.Int16(0),
+            )
+            _cute_ir.prefetch(value, [source.value])
+
+    @cute.jit
+    def _prefetch_weights(self, phase, sources, k_tile) -> None:
+        self._prefetch_tma(
+            phase.atoms[0], sources[0][(None, k_tile)], phase.descriptor_ptrs[0]
+        )
+        self._prefetch_tma(
+            phase.atoms[2], sources[2][(None, k_tile)], phase.descriptor_ptrs[2]
+        )
+
+    @cute.jit
+    def _startup_prefetch_weights(self, phase, k_tiles) -> None:
+        """Prefetch a unique weight prefix while dispatch publishes counts.
+
+        Predict one token block per expert. Empty experts or additional token
+        blocks affect usefulness only: no data or completion flag is changed.
+        The TMA partitions already select each CTA's half of a pair tile.
+        """
+        _, _, cluster = cute.arch.block_idx()
+        cta_rank = cute.arch.block_idx_in_cluster()
+        pair = 2 if self.two_cta else 1
+        linear = cluster * Int32(pair) + cta_rank
+        feature_blocks = cute.size(phase.global_partitions[0], mode=[1])
+        experts = cute.size(phase.global_partitions[0], mode=[3])
+        with cute.arch.elect_one():
+            for wave in cutlass.range_constexpr(self.startup_prefetch_waves):
+                tile = linear // Int32(pair) + Int32(
+                    wave * self.startup_prefetch_clusters
+                )
+                expert = tile // Int32(feature_blocks)
+                feature = tile % Int32(feature_blocks)
+                if expert < Int32(experts):
+                    sources = self.staging.slice_tma_sources(
+                        global_a=phase.global_partitions[0],
+                        global_b=phase.global_partitions[1],
+                        global_sfa=phase.global_partitions[2],
+                        global_sfb=phase.global_partitions[3],
+                        tile_mnl=(feature * Int32(pair) + cta_rank, Int32(0), expert),
+                    )
+                    for k_tile in cutlass.range(0, k_tiles, 1, unroll=1):
+                        self._prefetch_weights(phase, sources, k_tile)
 
     @cute.jit
     def _run_scheduler(self, scheduler, stats=None, entry=None) -> None:
@@ -322,6 +386,16 @@ class PersistentM128DeviceDriver:
         fc2_k_tiles,
         stats=None,
     ) -> None:
+        if cutlass.const_expr(self.startup_prefetch_waves > 0):
+            if cutlass.const_expr(stats is not None):
+                prefetch_start = globaltimer_lo()
+            self._startup_prefetch_weights(views.fc1, Int32(fc1_k_tiles))
+            if cutlass.const_expr(stats is not None):
+                self._record(
+                    stats,
+                    Slot.TMA_A_STARTUP_PREFETCH_NS,
+                    globaltimer_lo() - prefetch_start,
+                )
         if cutlass.const_expr(stats is not None):
             consume_start = globaltimer_lo()
         work = consumer.consume_work()

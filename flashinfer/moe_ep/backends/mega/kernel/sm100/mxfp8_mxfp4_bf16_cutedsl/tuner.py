@@ -2,7 +2,7 @@
 
 Invoked through the :mod:`flashinfer.moe_ep.tune` CLI shim (``--dtype
 mxfp8_mxfp4``). The default sweep times :func:`.config.candidate_tactics` for
-the shape (28 pair-tile tactics at 256-aligned shapes); ``--sweep schedule``
+the shape (32 pair-tile tactics at 256-aligned shapes); ``--sweep schedule``
 pins the rest of the default (or ``--base-knobs``) and sweeps
 ``load_balance_mode`` x ``group_hint``. Winners land in the knob cache under
 dtype ``mxfp8_mxfp4``, keyed on ``--max-tokens``; ``knobs=None`` workspaces
