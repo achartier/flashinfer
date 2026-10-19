@@ -790,6 +790,10 @@ The complete tactic schema, default capacity bands, environment switches,
 collective autotuning workflow, and cache behavior are documented in the
 [kernel README](flashinfer/moe_ep/cute_dsl/megamoe/mxfp8_mxfp4/README.md).
 Keep that reference synchronized with the backend config and kernel.
+The backend defaults to combined BF16 output; `output_mode="per_route"`
+returns unweighted BF16 `[tokens, top_k, hidden]` with masked slots zeroed
+and both top-k reducers disabled. Select the same mode on every EP rank
+before allocating the workspace.
 
 
 ## Development Workflow

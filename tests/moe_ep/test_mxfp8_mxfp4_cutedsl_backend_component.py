@@ -1,3 +1,6 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Focused host checks for MXFP8 x MXFP4 backend/config/weight plumbing."""
 
 from __future__ import annotations
@@ -22,8 +25,9 @@ from flashinfer.moe_ep.backends.mega.kernel.sm100.mxfp8_mxfp4_bf16_cutedsl impor
 from flashinfer.moe_ep.weights import MoEWeightPack
 
 
+@pytest.mark.parametrize("output_mode", ["combined", "per_route"])
 @pytest.mark.parametrize("owned_output", [False, True])
-def test_compute_uses_stable_reducer_output(monkeypatch, owned_output):
+def test_compute_uses_stable_reducer_output(monkeypatch, owned_output, output_mode):
     from flashinfer.moe_ep.backends.mega.kernel.sm100.mxfp8_mxfp4_bf16_cutedsl.backend import (
         Mxfp8Mxfp4CutedslMegaKernelBackend,
     )
@@ -33,7 +37,11 @@ def test_compute_uses_stable_reducer_output(monkeypatch, owned_output):
     backend = object.__new__(Mxfp8Mxfp4CutedslMegaKernelBackend)
     backend._autotune_pending = False
     backend._kernel_config = SimpleNamespace(gate_up_clamp=None, fast_math=False)
-    view = torch.full((2, 128), 3.0, dtype=torch.bfloat16)
+    view = torch.full(
+        (2, 128) if output_mode == "combined" else (2, 4, 128),
+        3.0,
+        dtype=torch.bfloat16,
+    )
     output = torch.empty_like(view) if owned_output else None
     workspace = SimpleNamespace(topk_idx=object())
 
@@ -129,8 +137,15 @@ def test_in_kernel_reduce_rejects_non_boolean_tactic(value) -> None:
 
 def test_pair_tile_candidates_cover_every_default() -> None:
     shape = dict(hidden=4096, intermediate=6400)
-    candidates = candidate_tactics(**shape)
+    all_candidates = candidate_tactics(**shape)
+    assert len(all_candidates) == 64
+    candidates = [c for c in all_candidates if c["persistent_clusters"] is None]
     assert len(candidates) == 32
+    capped = [c for c in all_candidates if c["persistent_clusters"] == 64]
+    assert len(capped) == 32
+    assert capped == [dict(c, persistent_clusters=64) for c in candidates]
+    for candidate in all_candidates:
+        validate_tactic(candidate, partial=False)
     alternating = [c for c in candidates if c["load_balance_mode"] == "alternating"]
     assert len(alternating) == 4
     assert {c["mma_tiler_mnk"] for c in alternating} == {(256, 192, 128)}
@@ -319,9 +334,6 @@ def test_tactic_defaults_candidates_and_partial_overrides_are_valid() -> None:
     assert {candidate["mma_tiler_mnk"][1] for candidate in candidates} == {64, 128}
     assert {candidate["group_hint"] for candidate in candidates} == {512, 4096}
     assert {candidate["load_balance_mode"] for candidate in candidates} == {"static"}
-    assert {candidate["token_back_schedule_mode"] for candidate in candidates} == {
-        "static"
-    }
     assert {candidate["token_back_mode"] for candidate in candidates} == {"epi_warps"}
     assert {candidate["mma_tiler_mnk"][0] for candidate in candidates} == {128}
     assert {candidate["cluster_shape_mnk"] for candidate in candidates} == {(1, 1, 1)}
@@ -331,9 +343,9 @@ def test_tactic_defaults_candidates_and_partial_overrides_are_valid() -> None:
     validate_tactic({"load_balance_mode": "alternating"})
     with pytest.raises(ValueError, match="load_balance_mode"):
         validate_tactic({"load_balance_mode": "unknown"})
-    # FC1/FC2 alternation does not change the token-back scheduler's modes.
-    with pytest.raises(ValueError, match="token_back_schedule_mode"):
-        validate_tactic({"token_back_schedule_mode": "alternating"})
+    # Dispatch-warp token-back and its claim schedule were removed.
+    with pytest.raises(ValueError, match="unknown MXFP8 x MXFP4 tactic keys"):
+        validate_tactic({"token_back_schedule_mode": "static"})
 
     for unsupported_n in (32, 256):
         with pytest.raises(ValueError, match="N must be 64, 128, or 192"):
@@ -425,124 +437,51 @@ def test_weight_validation_rejects_non_bf16_and_wrong_e8m0_contract() -> None:
         )
 
 
-def test_dispatch_dedup_default_env_and_override(monkeypatch):
-    from flashinfer.moe_ep.backends.mega.kernel.sm100.mxfp8_mxfp4_bf16_cutedsl.config import (
-        DISPATCH_DEDUP_ENV,
-        resolve_tactic,
-    )
-
-    monkeypatch.delenv(DISPATCH_DEDUP_ENV, raising=False)
-    assert default_tactic(1024)["dispatch_dedup"] is False
-    monkeypatch.setenv(DISPATCH_DEDUP_ENV, "1")
-    assert default_tactic(1024)["dispatch_dedup"] is True
-    assert resolve_tactic(1024, {"dispatch_dedup": False})["dispatch_dedup"] is False
-    monkeypatch.setenv(DISPATCH_DEDUP_ENV, "true")
-    with pytest.raises(ValueError, match=DISPATCH_DEDUP_ENV):
-        default_tactic(1024)
-    for value in (0, 1, "true", None):
-        with pytest.raises(ValueError, match="dispatch_dedup must be a bool"):
-            validate_tactic({"dispatch_dedup": value})
+@pytest.mark.parametrize("value", [1, 0, "yes", None])
+def test_startup_fixes_require_bool(value):
+    with pytest.raises(ValueError, match="cta_local_counts"):
+        validate_tactic({"cta_local_counts": value})
 
 
-@pytest.mark.parametrize("mode", ["direct", "staged64", "staged256"])
-def test_fc2_store_mode_resolution(mode, monkeypatch):
-    name = "FLASHINFER_MXFP8_MXFP4_FC2_STORE_MODE"
-    monkeypatch.delenv(name, raising=False)
-    assert default_tactic(256)["fc2_store_mode"] == "staged256"
-    monkeypatch.setenv(name, mode)
-    assert default_tactic(256)["fc2_store_mode"] == mode
-    assert (
-        resolve_tactic(256, {"fc2_store_mode": "direct"})["fc2_store_mode"] == "direct"
-    )
-    monkeypatch.setenv(name, "invalid")
-    with pytest.raises(ValueError, match="FC2_STORE_MODE"):
-        default_tactic(256)
-    with pytest.raises(ValueError, match="fc2_store_mode"):
-        validate_tactic({"fc2_store_mode": "invalid"})
+@pytest.mark.parametrize("value", [0, -1, True, 1.5, "64"])
+def test_persistent_clusters_rejects_invalid_values(value: object) -> None:
+    with pytest.raises(ValueError, match="persistent_clusters"):
+        validate_tactic({"persistent_clusters": value})
 
 
-@pytest.mark.parametrize("value", [-1, 4, True, 1.5, "2", None])
-def test_startup_prefetch_rejects_invalid_waves(value):
-    with pytest.raises(ValueError, match="startup_prefetch_waves"):
-        validate_tactic({"startup_prefetch_waves": value})
-
-
-def test_startup_prefetch_environment_and_override(monkeypatch):
-    name = "FLASHINFER_MXFP8_MXFP4_STARTUP_PREFETCH_WAVES"
-    monkeypatch.delenv(name, raising=False)
-    assert default_tactic(64)["startup_prefetch_waves"] == 0
-    monkeypatch.setenv(name, "2")
-    assert default_tactic(64)["startup_prefetch_waves"] == 2
-    assert (
-        resolve_tactic(64, {"startup_prefetch_waves": 0})["startup_prefetch_waves"] == 0
-    )
-    monkeypatch.setenv(name, "4")
-    with pytest.raises(ValueError, match=name):
-        default_tactic(64)
+def test_persistent_cluster_tactic_validation_and_defaults() -> None:
+    for clusters in (None, 1, 64, 72, 1000):
+        validate_tactic({"persistent_clusters": clusters})
+    tactic = default_tactic(1024, hidden=4096, intermediate=6400)
+    assert tactic["persistent_clusters"] is None
 
 
 @pytest.mark.parametrize(
-    "tile,cluster", [((128, 64, 128), (2, 1, 1)), ((128, 64, 128), (1, 2, 1))]
+    "mode,shape", [("combined", (3, 128)), ("per_route", (3, 4, 128))]
 )
-def test_startup_prefetch_rejects_unsupported_cluster(tile, cluster):
-    with pytest.raises(ValueError, match="startup prefetch"):
-        resolve_tactic(
-            64,
-            {
-                "startup_prefetch_waves": 2,
-                "mma_tiler_mnk": tile,
-                "cluster_shape_mnk": cluster,
-            },
+def test_output_mode_shape_and_workspace_identity(mode, shape, monkeypatch):
+    from flashinfer.moe_ep import BootstrapConfig, FleetParams
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.mxfp8_mxfp4_bf16_cutedsl.backend import (
+        Mxfp8Mxfp4CutedslMegaKernelBackend,
+    )
+
+    config = Sm100_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig(
+        intermediate_size=128, top_k=4, output_mode=mode
+    )
+    backend = Mxfp8Mxfp4CutedslMegaKernelBackend(config)
+    backend.bind_ep_bootstrap(
+        BootstrapConfig(world_size=1, rank=0, auto_bootstrap=False)
+    )
+    fleet = FleetParams(num_experts=4, max_tokens_per_rank=16, token_hidden_size=128)
+    assert backend.output_shape(3, fleet) == shape
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    key = backend._workspace_pool_key(fleet)
+    config.output_mode = "per_route" if mode == "combined" else "combined"
+    assert backend._workspace_pool_key(fleet) != key
+
+
+def test_invalid_output_mode_rejected():
+    with pytest.raises(ValueError, match="output_mode"):
+        Sm100_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig(
+            intermediate_size=128, top_k=4, output_mode="weighted_routes"
         )
-
-
-@pytest.mark.parametrize("mma_m,clusters", [(128, 148), (256, 74)])
-@pytest.mark.parametrize("requested", [0, 1, 2, 3])
-def test_startup_prefetch_l2_budget(mma_m, clusters, requested):
-    from flashinfer.moe_ep.cute_dsl.megamoe.mxfp8_mxfp4.startup_prefetch import (
-        plan_startup_prefetch,
-    )
-
-    plan = plan_startup_prefetch(
-        requested,
-        hidden=4096,
-        intermediate=6400,
-        experts=32,
-        mma_m=mma_m,
-        clusters=clusters,
-        l2_bytes=126 * 1024**2,
-    )
-    assert plan.bytes_per_wave == 148 * (256 + 16) * 1024
-    assert plan.waves == min(requested, 2)
-    assert plan.waves * plan.bytes_per_wave <= plan.budget_bytes
-    assert plan.budget_bytes == plan.l2_bytes * 4 // 5
-
-
-def test_startup_prefetch_small_prefix_and_no_capacity():
-    from flashinfer.moe_ep.cute_dsl.megamoe.mxfp8_mxfp4.startup_prefetch import (
-        plan_startup_prefetch,
-    )
-
-    args = dict(hidden=256, intermediate=256, experts=2, mma_m=256, clusters=74)
-    plan = plan_startup_prefetch(3, **args, l2_bytes=126 * 1024**2)
-    assert plan.waves == 1  # Never reissue beyond the unique weight prefix.
-    assert plan.bytes_per_wave == 2 * 512 * (128 + 8)
-    assert plan_startup_prefetch(3, **args, l2_bytes=0).waves == 0
-
-
-@pytest.mark.parametrize("value", [0, 1, None, "true"])
-def test_vector_count_publish_requires_bool(value):
-    with pytest.raises(ValueError, match="vector_count_publish"):
-        validate_tactic({"vector_count_publish": value})
-
-
-@pytest.mark.parametrize("key", ["cta_local_counts", "overlap_dispatch_pull"])
-@pytest.mark.parametrize("value", [1, 0, "yes", None])
-def test_startup_fixes_require_bool(key, value):
-    with pytest.raises(ValueError, match=key):
-        validate_tactic({key: value})
-
-
-def test_overlap_pull_rejects_dedup():
-    with pytest.raises(ValueError, match="dispatch_dedup"):
-        validate_tactic({"overlap_dispatch_pull": True, "dispatch_dedup": True})

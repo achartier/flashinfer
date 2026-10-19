@@ -92,9 +92,7 @@ class Mxfp8DispatchPhase:
         num_other_warps: int,
         flag_batch: int = 1,
         rank: int = 0,
-        vector_count_publish: bool = False,
         cta_local_counts: bool = False,
-        overlap_dispatch_pull: bool = False,
     ) -> None:
         if not 1 <= config.world_size <= 16:
             raise ValueError("NVLink dispatch supports 1 <= world_size <= 16")
@@ -115,51 +113,30 @@ class Mxfp8DispatchPhase:
         self.dispatch_warp_start = dispatch_warp_start
         self.num_other_warps = num_other_warps
         self.flag_batch = flag_batch
-        self.vector_count_publish = vector_count_publish
-        if overlap_dispatch_pull and config.dispatch_dedup:
-            raise ValueError(
-                "overlap_dispatch_pull cannot be combined with dispatch_dedup"
-            )
         self.cta_local_counts = cta_local_counts
-        self.overlap_dispatch_pull = overlap_dispatch_pull
         self._token_comm: Any | None = None
         self._tail_reduce: Any | None = None
 
-    def bind_in_kernel_reduce(
-        self, route_terms: Any, output: Any, *, scratch: Any, scratch_bytes: int
-    ) -> None:
+    def bind_in_kernel_reduce(self, route_terms: Any, output: Any) -> None:
         """Bind device-region operands for the optional all-warp tail reduce."""
 
-        import os
-
-        from .combine import PipelinedInKernelTopKReduction, combine_chunk_elements
         from .fc2_epilogue import InKernelTopKReduction
-
-        chunk = combine_chunk_elements(
-            self.config.hidden,
-            self.num_other_warps + self.num_dispatch_warps,
-            scratch_bytes,
-        )
-        if (
-            os.environ.get("FLASHINFER_MXFP8_MXFP4_PIPELINED_COMBINE", "0") == "1"
-            and chunk
-            and self.config.num_topk <= 32
-        ):
-            self._tail_reduce = PipelinedInKernelTopKReduction(
-                hidden=self.config.hidden,
-                num_topk=self.config.num_topk,
-                route_terms=route_terms,
-                output=output,
-                scratch=scratch,
-                chunk=chunk,
-            )
-            return
 
         self._tail_reduce = InKernelTopKReduction(
             hidden=self.config.hidden,
             num_topk=self.config.num_topk,
             route_terms=route_terms,
             output=output,
+        )
+
+    def bind_per_route_output(self, route_terms: Any) -> None:
+        """Finish direct FC2 output by defining masked slots inside the tail."""
+        from .fc2_epilogue import ClearMaskedRouteTerms
+
+        self._tail_reduce = ClearMaskedRouteTerms(
+            hidden=self.config.hidden,
+            num_topk=self.config.num_topk,
+            route_terms=route_terms,
         )
 
     @property
@@ -176,30 +153,6 @@ class Mxfp8DispatchPhase:
             comm_class = overwrite_count_token_comm_class(
                 token_comm_module.TokenInPullTokenBackPush
             )
-            if self.overlap_dispatch_pull:
-                from .dispatch_overlap import overlapping_token_comm_class
-
-                comm_class = overlapping_token_comm_class(comm_class)
-            if self.config.dispatch_dedup:
-                from .dispatch_dedup import deduplicating_token_comm_class
-                from .workspace import make_workspace_plan
-
-                plan = make_workspace_plan(self.config)
-                shared = plan.shared
-                stats_offsets = _dispatch_stats_word_offsets(self.config)
-                fetch_stats_offset = None
-                if stats_offsets is not None:
-                    fetch_stats_offset = (
-                        plan.local.region("wait_stats").offset
-                        - plan.local.region("l1_arrival_count").offset
-                    ) // 4
-                sibling_offset = (
-                    shared.region("src_sibling_idx").offset
-                    - shared.region("src_token_topk_idx").offset
-                ) // 4
-                comm_class = deduplicating_token_comm_class(
-                    comm_class, sibling_offset, fetch_stats_offset
-                )
             stats_offsets = _dispatch_stats_word_offsets(self.config)
             if stats_offsets is not None:
                 comm_class = _timed_token_comm_class(comm_class)
@@ -211,16 +164,12 @@ class Mxfp8DispatchPhase:
                 dispatch_warp_start=self.dispatch_warp_start,
                 num_other_warps=self.num_other_warps,
                 flag_batch=self.flag_batch,
-                # The helper's historical N name denotes the output-feature
-                # extent. Swap-AB uses M128 per CTA, replicated along cluster M.
-                fc2_n_tile=128 * self.cluster_shape_mn[0],
             )
             self._token_comm = binding.instantiate(
                 helper_type=comm_class,
                 fc1_token_dtype=cutlass.Float8E4M3FN,
                 combine_format=None,
             )
-            self._token_comm.vector_count_publish = self.vector_count_publish
             self._token_comm.cta_local_counts = self.cta_local_counts
             if stats_offsets is not None:
                 self._token_comm.stats_word_offsets = stats_offsets
@@ -743,7 +692,6 @@ class SingleRankMxfp8Dispatch:
         num_sms: int | None = None,
         flag_batch: int = 1,
         cta_local_counts: bool = False,
-        overlap_dispatch_pull: bool = False,
     ) -> None:
         if config.world_size != 1:
             raise NotImplementedError(
@@ -756,12 +704,7 @@ class SingleRankMxfp8Dispatch:
         self.config = config
         self.num_sms = num_sms
         self.flag_batch = flag_batch
-        if overlap_dispatch_pull and config.dispatch_dedup:
-            raise ValueError(
-                "overlap_dispatch_pull cannot be combined with dispatch_dedup"
-            )
         self.cta_local_counts = cta_local_counts
-        self.overlap_dispatch_pull = overlap_dispatch_pull
 
     @staticmethod
     def _require_tensor(
@@ -844,7 +787,6 @@ class SingleRankMxfp8Dispatch:
             num_other_warps=1,
             flag_batch=self.flag_batch,
             cta_local_counts=self.cta_local_counts,
-            overlap_dispatch_pull=self.overlap_dispatch_pull,
         )
 
         @cute.kernel

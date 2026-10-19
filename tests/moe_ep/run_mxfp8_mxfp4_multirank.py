@@ -42,6 +42,9 @@ def _knobs(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--output-mode", choices=("combined", "per_route"), default="combined"
+    )
     parser.add_argument("--hidden", type=int, default=256)
     parser.add_argument("--intermediate", type=int, default=256)
     parser.add_argument("--experts", type=int)
@@ -187,6 +190,7 @@ def main():
         rank,
         world,
         knobs=_knobs(args),
+        output_mode=args.output_mode,
     )
     workspace.x.copy_(xq[rank])
     workspace.x_sf.view(torch.uint8).copy_(xs[rank])
@@ -207,7 +211,8 @@ def main():
             w2_scale=w2s,
         )
         if not args.bounded_reference:
-            return compute_reference(**kwargs).output
+            ref = compute_reference(**kwargs)
+            return ref.route_terms if args.output_mode == "per_route" else ref.output
         # Only one expert's weights are dequantized at a time. Keep unweighted
         # BF16 route terms, NOT the oracle's already rounded weighted outputs.
         terms = torch.zeros(
@@ -226,6 +231,8 @@ def main():
             )
             # Expert route sets are disjoint; adding zero changes no BF16 term.
             terms.add_(compute_reference(**kwargs).route_terms)
+        if args.output_mode == "per_route":
+            return terms
         result = torch.zeros(
             (world, tokens, hidden), dtype=torch.float32, device="cuda"
         )
@@ -288,6 +295,7 @@ def main():
                         "experts": experts,
                         "top_k": topk,
                         "oracle": "all-output",
+                        "output_mode": args.output_mode,
                         "status": "passed",
                         "max_error": (
                             (actual.float() - expected.float()).abs().max().item()

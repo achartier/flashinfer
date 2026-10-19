@@ -1,3 +1,6 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Configuration and tactic schema for native MXFP8 x MXFP4 MegaMoE."""
 
 from __future__ import annotations
@@ -22,12 +25,6 @@ EIGHT_WARP_EPILOGUE_MIN_TOKENS = 256
 IN_KERNEL_REDUCE_ENV = "FLASHINFER_MXFP8_MXFP4_IN_KERNEL_REDUCE"
 # The top-k reduction runs in the kernel tail below this many tokens per rank.
 IN_KERNEL_REDUCE_MAX_TOKENS = 256
-# Experimental per-owner fetch dedup; explicit tactics override the environment.
-DISPATCH_DEDUP_ENV = "FLASHINFER_MXFP8_MXFP4_DISPATCH_DEDUP"
-STARTUP_PREFETCH_WAVES_ENV = "FLASHINFER_MXFP8_MXFP4_STARTUP_PREFETCH_WAVES"
-FC2_STORE_MODE_ENV = "FLASHINFER_MXFP8_MXFP4_FC2_STORE_MODE"
-FC2_STORE_MODES = ("direct", "staged64", "staged256")
-Fc2StoreMode = Literal["direct", "staged64", "staged256"]
 LoadBalanceMode = Literal["static", "atomic_counter", "alternating"]
 # When set (static, atomic_counter or alternating), replaces the default
 # ``load_balance_mode`` band; explicit tactic overrides still win.
@@ -46,18 +43,13 @@ class Mxfp8Mxfp4Tactic(TypedDict, total=False):
     cluster_shape_mnk: tuple[int, int, int]
     num_stages: int | Literal["auto"]
     group_hint: int | None
+    persistent_clusters: int | None
     flag_batch: int
     load_balance_mode: LoadBalanceMode
-    token_back_mode: Literal["epi_warps", "reuse_dispatch_warps"]
-    token_back_schedule_mode: Literal["static", "atomic_counter"]
+    token_back_mode: Literal["epi_warps"]
     epilogue_warps: Literal[4, 8]
     in_kernel_reduce: bool
-    dispatch_dedup: bool
-    fc2_store_mode: Fc2StoreMode
-    startup_prefetch_waves: int
-    vector_count_publish: bool
     cta_local_counts: bool
-    overlap_dispatch_pull: bool
 
 
 _TACTIC_KEYS = frozenset(Mxfp8Mxfp4Tactic.__annotations__)
@@ -109,16 +101,6 @@ def validate_tactic(tactic: Mapping[str, Any], *, partial: bool = True) -> None:
     ):
         raise ValueError("MMA M=256 (2-CTA) requires cluster_shape_mnk=(2, 1, 1)")
 
-    waves = tactic.get("startup_prefetch_waves", 0)
-    if type(waves) is not int or not 0 <= waves <= 3:
-        raise ValueError("startup_prefetch_waves must be an integer in [0, 3]")
-    if waves and cluster is not None and cluster not in ((1, 1, 1), (2, 1, 1)):
-        raise ValueError(
-            "startup prefetch requires a single CTA or feature pair cluster"
-        )
-    if waves and tile is not None and cluster == (2, 1, 1) and tile[0] != 256:
-        raise ValueError("startup prefetch with a pair cluster requires MMA M=256")
-
     stages = tactic.get("num_stages")
     if (
         stages is not None
@@ -129,6 +111,9 @@ def validate_tactic(tactic: Mapping[str, Any], *, partial: bool = True) -> None:
     group_hint = tactic.get("group_hint")
     if group_hint is not None and (not isinstance(group_hint, int) or group_hint <= 0):
         raise ValueError("group_hint must be None or a positive integer")
+    clusters = tactic.get("persistent_clusters")
+    if clusters is not None and (type(clusters) is not int or clusters <= 0):
+        raise ValueError("persistent_clusters must be None or a positive integer")
     flag_batch = tactic.get("flag_batch")
     if flag_batch is not None and (
         not isinstance(flag_batch, int) or not 1 <= flag_batch <= 32
@@ -142,34 +127,15 @@ def validate_tactic(tactic: Mapping[str, Any], *, partial: bool = True) -> None:
         raise ValueError(
             "load_balance_mode must be static, atomic_counter, or alternating"
         )
-    if tactic.get("token_back_mode", "epi_warps") not in (
-        "epi_warps",
-        "reuse_dispatch_warps",
-    ):
+    if tactic.get("token_back_mode", "epi_warps") != "epi_warps":
         raise ValueError(
-            "token_back_mode must be epi_warps or reuse_dispatch_warps; "
-            "standalone_warps is unsupported"
+            "token_back_mode must be epi_warps (dispatch-warp and standalone "
+            "token-back are unsupported)"
         )
-    if tactic.get("token_back_schedule_mode", "static") not in (
-        "static",
-        "atomic_counter",
-    ):
-        raise ValueError("unsupported token_back_schedule_mode")
     if tactic.get("epilogue_warps", 4) not in (4, 8):
         raise ValueError("epilogue_warps must be 4 or 8")
-    if tactic.get("fc2_store_mode", "direct") not in FC2_STORE_MODES:
-        raise ValueError(f"fc2_store_mode must be one of {FC2_STORE_MODES}")
-    for key in ("cta_local_counts", "overlap_dispatch_pull"):
-        if not isinstance(tactic.get(key, False), bool):
-            raise ValueError(f"{key} must be a bool")
-    if tactic.get("overlap_dispatch_pull", False) and tactic.get(
-        "dispatch_dedup", False
-    ):
-        raise ValueError("overlap_dispatch_pull cannot be combined with dispatch_dedup")
-    if not isinstance(tactic.get("vector_count_publish", False), bool):
-        raise ValueError("vector_count_publish must be a bool")
-    if not isinstance(tactic.get("dispatch_dedup", False), bool):
-        raise ValueError("dispatch_dedup must be a bool")
+    if not isinstance(tactic.get("cta_local_counts", False), bool):
+        raise ValueError("cta_local_counts must be a bool")
     if not isinstance(tactic.get("in_kernel_reduce", False), bool):
         raise ValueError("in_kernel_reduce must be a bool")
 
@@ -192,27 +158,6 @@ def supports_two_cta(hidden: int | None, intermediate: int | None) -> bool:
         and hidden % 256 == 0
         and (2 * intermediate) % 256 == 0
     )
-
-
-def default_startup_prefetch_waves() -> int:
-    value = os.environ.get(STARTUP_PREFETCH_WAVES_ENV, "0").strip() or "0"
-    if value not in ("0", "1", "2", "3"):
-        raise ValueError(f"{STARTUP_PREFETCH_WAVES_ENV} must be 0, 1, 2, or 3")
-    return int(value)
-
-
-def default_fc2_store_mode() -> Fc2StoreMode:
-    value = os.environ.get(FC2_STORE_MODE_ENV, "staged256").strip() or "staged256"
-    if value not in FC2_STORE_MODES:
-        raise ValueError(f"{FC2_STORE_MODE_ENV} must be one of {FC2_STORE_MODES}")
-    return cast(Fc2StoreMode, value)
-
-
-def _default_dispatch_dedup() -> bool:
-    value = os.environ.get(DISPATCH_DEDUP_ENV, "0").strip() or "0"
-    if value not in ("0", "1"):
-        raise ValueError(f"{DISPATCH_DEDUP_ENV} must be 0 or 1, got {value!r}")
-    return value == "1"
 
 
 def _default_in_kernel_reduce(max_tokens_per_rank: int) -> bool:
@@ -266,19 +211,14 @@ def default_tactic(
         "mma_tiler_mnk": (256 if pair else 128, token_tile, 128),
         "cluster_shape_mnk": (2, 1, 1) if pair else (1, 1, 1),
         "num_stages": "auto",
+        "persistent_clusters": None,
         "group_hint": 512 if small_groups else 4096,
-        "flag_batch": 2,
+        "flag_batch": 1,
         "load_balance_mode": _default_load_balance_mode(max_tokens_per_rank, pair),
         "token_back_mode": "epi_warps",
-        "token_back_schedule_mode": "static",
         "epilogue_warps": _default_epilogue_warps(max_tokens_per_rank, pair),
         "in_kernel_reduce": _default_in_kernel_reduce(max_tokens_per_rank),
-        "dispatch_dedup": _default_dispatch_dedup(),
-        "fc2_store_mode": default_fc2_store_mode(),
-        "startup_prefetch_waves": default_startup_prefetch_waves(),
-        "vector_count_publish": False,
-        "cta_local_counts": False,
-        "overlap_dispatch_pull": False,
+        "cta_local_counts": True,
     }
     validate_tactic(tactic, partial=False)
     return tactic
@@ -327,6 +267,11 @@ def candidate_tactics(
                 tactic["load_balance_mode"] = "atomic_counter"
                 validate_tactic(tactic, partial=False)
                 candidates.append(tactic)
+        for tactic in candidates.copy():
+            capped = tactic.copy()
+            capped["persistent_clusters"] = 64
+            validate_tactic(capped, partial=False)
+            candidates.append(capped)
         return candidates
     for n in (64, 128):
         for stages in ("auto", 3, 4, 5):
@@ -382,7 +327,12 @@ def _mxfp8_mxfp4_quant_config() -> QuantConfig:
 
 @dataclass
 class Sm100_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig:
-    """Public config for E4M3/K32 activations and E2M1/K32 weights."""
+    """Public config for E4M3/K32 activations and E2M1/K32 weights.
+
+    ``output_mode="combined"`` returns the weighted top-k sum; ``"per_route"``
+    returns unweighted BF16 ``[tokens, top_k, hidden]`` with zero masked slots.
+    Select the same mode on every EP rank before creating a workspace.
+    """
 
     intermediate_size: int
     top_k: int
@@ -391,8 +341,11 @@ class Sm100_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig:
     gate_up_clamp: float | None = None
     fast_math: bool = True
     knobs: Mxfp8Mxfp4Tactic | Literal["auto"] | None = None
+    output_mode: Literal["combined", "per_route"] = "combined"
 
     def __post_init__(self) -> None:
+        if self.output_mode not in ("combined", "per_route"):
+            raise ValueError("output_mode must be combined or per_route")
         if self.kernel_name != KERNEL_NAME:
             raise ValueError(f"kernel_name is fixed to {KERNEL_NAME!r}")
         if self.quant.pair != (QuantFormat.MXFP4, QuantFormat.MXFP8) or (
@@ -421,7 +374,6 @@ class Sm100_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig:
 
 
 __all__ = [
-    "DISPATCH_DEDUP_ENV",
     "EIGHT_WARP_EPILOGUE_MIN_TOKENS",
     "EPILOGUE_WARPS_ENV",
     "ALTERNATING_CLAIM_TOKENS",

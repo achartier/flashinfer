@@ -62,9 +62,6 @@ def _workspace_plan(
             sf_padding_block=128,
             cluster_tile_tokens=cluster_tokens,
             load_balance_mode=tactic["load_balance_mode"],
-            dispatch_dedup=tactic["dispatch_dedup"],
-            token_back_by_dispatch=tactic["token_back_mode"] == "reuse_dispatch_warps",
-            token_back_schedule_mode=tactic["token_back_schedule_mode"],
         )
     )
 
@@ -96,6 +93,7 @@ class Mxfp8Mxfp4MegaMoeWorkspace:
     y: torch.Tensor
     workspace_bytes: torch.Tensor
     shared_workspace_bytes: torch.Tensor
+    output_mode: str = "combined"
     symmetric_base: int = 0
     peer_offsets_list: tuple[int, ...] = (0,)
     _symmetric_root: torch.Tensor | None = field(default=None, repr=False)
@@ -209,7 +207,12 @@ class Mxfp8Mxfp4MegaMoeWorkspace:
     ) -> Mxfp8Mxfp4Frontend:
         if self._destroyed:
             raise RuntimeError("MXFP8 x MXFP4 MegaMoE workspace is destroyed")
-        key = (gate_up_clamp, bool(fast_math), _tactic_key(self.tactic))
+        key = (
+            gate_up_clamp,
+            bool(fast_math),
+            _tactic_key(self.tactic),
+            self.output_mode,
+        )
         frontend = self._frontends.get(key)
         if frontend is None:
             from .persistent_kernel import PersistentMxfp8Mxfp4KernelAdapter
@@ -226,6 +229,7 @@ class Mxfp8Mxfp4MegaMoeWorkspace:
                 num_experts=self.num_local_experts,
                 max_tokens=self.max_tokens_per_rank,
                 tactic=static_tactic,
+                output_mode=self.output_mode,
             )
             frontend = Mxfp8Mxfp4Frontend(
                 config,
@@ -234,6 +238,7 @@ class Mxfp8Mxfp4MegaMoeWorkspace:
                     tactic=self.tactic,
                     gate_up_clamp=gate_up_clamp,
                     fast_math=fast_math,
+                    output_mode=self.output_mode,
                 ),
             )
             self._frontends[key] = frontend
@@ -373,6 +378,7 @@ def get_symm_buffer_for_mxfp8_mxfp4_mega_moe(
     gate_up_clamp: float | None = None,
     knobs: Mapping[str, Any] | None = None,
     capacity_tactics: Sequence[Mapping[str, Any]] | None = None,
+    output_mode: str = "combined",
 ) -> Mxfp8Mxfp4MegaMoeWorkspace:
     """Allocate the mixed-format workspace without importing the device kernel.
 
@@ -382,9 +388,14 @@ def get_symm_buffer_for_mxfp8_mxfp4_mega_moe(
     (``{}`` for the default) to bypass the cache. ``capacity_tactics`` sizes
     the buffers for every listed tactic as well, so
     :meth:`Mxfp8Mxfp4MegaMoeWorkspace.apply_knobs` can switch among them.
+    ``output_mode="per_route"`` selects direct unweighted BF16 route output
+    and the separate ``mxfp8_mxfp4_per_route`` tuning namespace. All EP ranks
+    must select the same mode; warm up before CUDA graph capture.
     """
 
     del gate_up_clamp
+    if output_mode not in ("combined", "per_route"):
+        raise ValueError("output_mode must be combined or per_route")
     _validate_ep_geometry(num_experts, rank, world_size)
     from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.comm import (
         ensure_not_capturing,
@@ -408,7 +419,11 @@ def get_symm_buffer_for_mxfp8_mxfp4_mega_moe(
         )
 
         cached = lookup_knobs(
-            dtype=KNOB_CACHE_DTYPE,
+            dtype=(
+                KNOB_CACHE_DTYPE
+                if output_mode == "combined"
+                else KNOB_CACHE_DTYPE + "_per_route"
+            ),
             world_size=world_size,
             hidden=hidden,
             intermediate=intermediate,
@@ -464,6 +479,7 @@ def get_symm_buffer_for_mxfp8_mxfp4_mega_moe(
                     hidden,
                     intermediate,
                     _tactic_key(tactic),
+                    output_mode,
                     local_bytes,
                     shared_bytes,
                 ),
@@ -516,6 +532,7 @@ def get_symm_buffer_for_mxfp8_mxfp4_mega_moe(
         shared_workspace_bytes=allocate(
             "shared_workspace_bytes", (shared_bytes,), torch.uint8, fill=0
         ),
+        output_mode=output_mode,
         symmetric_base=symmetric_base,
         peer_offsets_list=peer_offsets,
         _symmetric_root=symmetric_root,
@@ -532,11 +549,35 @@ def mxfp8_mxfp4_mega_moe(
     gate_up_clamp: float | None = None,
     fast_math: bool = True,
 ) -> torch.Tensor:
-    """Compile/bind lazily and launch the persistent mixed-format kernel."""
+    """Launch with the output mode selected when allocating ``workspace``.
+
+    Combined mode returns BF16 [num_tokens, hidden]; per_route returns
+    unweighted BF16 [num_tokens, topk, hidden], with zero masked slots.
+    With output=None the result borrows workspace storage until reuse.
+    Otherwise the caller supplies a contiguous BF16 destination (per-route
+    output is copied from the symmetric plane after peer completion).
+    """
 
     if not 0 <= num_tokens <= workspace.max_tokens_per_rank:
         raise ValueError("num_tokens exceeds the allocated workspace")
-    destination = workspace.y if output is None else output
+    per_route = workspace.output_mode == "per_route"
+    if per_route and output is not None:
+        if (
+            output.dtype != torch.bfloat16
+            or output.device != workspace.x.device
+            or tuple(output.shape) != (num_tokens, workspace.num_topk, workspace.hidden)
+            or not output.is_contiguous()
+        ):
+            raise ValueError(
+                "per-route output must be contiguous BF16 [num_tokens, topk, hidden] on the workspace device"
+            )
+    # Remote FC2 stores target the symmetric route plane. Bind that stable
+    # plane even when the caller requests an owned copy (also graph-safe).
+    destination = (
+        workspace.route_terms
+        if per_route
+        else (workspace.y if output is None else output)
+    )
     frontend = workspace.frontend(
         gate_up_clamp=gate_up_clamp,
         fast_math=fast_math,
@@ -559,7 +600,11 @@ def mxfp8_mxfp4_mega_moe(
         stream=torch.cuda.current_stream().cuda_stream,
         static_tactic=frontend.config.tactic,
     )
-    return frontend.run(spec)
+    result = frontend.run(spec)
+    if per_route and output is not None:
+        output.copy_(result)
+        return output
+    return result
 
 
 def autotune_mxfp8_mxfp4_mega_moe(
@@ -638,7 +683,11 @@ def autotune_mxfp8_mxfp4_mega_moe(
 
             record_knobs(
                 workspace.resolve(winner),
-                dtype=KNOB_CACHE_DTYPE,
+                dtype=(
+                    KNOB_CACHE_DTYPE
+                    if workspace.output_mode == "combined"
+                    else KNOB_CACHE_DTYPE + "_per_route"
+                ),
                 world_size=workspace.world_size,
                 hidden=workspace.hidden,
                 intermediate=workspace.intermediate,
@@ -672,6 +721,7 @@ def create_dummy_mxfp8_mxfp4_inputs(
     *,
     gate_up_clamp: float | None = None,
     seed: int = 0,
+    output_mode: str = "combined",
     capacity_tactics: Sequence[Mapping[str, Any]] | None = None,
 ) -> tuple[
     torch.Tensor,
@@ -740,6 +790,7 @@ def create_dummy_mxfp8_mxfp4_inputs(
         world_size,
         knobs={},
         capacity_tactics=capacity_tactics,
+        output_mode=output_mode,
     )
     hidden_states = torch.randn(
         live_tokens, hidden, dtype=torch.bfloat16, device=device, generator=generator
@@ -762,7 +813,12 @@ def create_dummy_mxfp8_mxfp4_inputs(
     if live_tokens < max_tokens:
         workspace.topk_idx[live_tokens:].fill_(-1)
     note_staged_tokens(workspace.topk_idx, live_tokens)
-    output = torch.empty(live_tokens, hidden, dtype=torch.bfloat16, device=device)
+    output_shape = (
+        (live_tokens, hidden)
+        if output_mode == "combined"
+        else (live_tokens, topk, hidden)
+    )
+    output = torch.empty(output_shape, dtype=torch.bfloat16, device=device)
     del gate_up_clamp
     return output, fc1, fc2, workspace
 

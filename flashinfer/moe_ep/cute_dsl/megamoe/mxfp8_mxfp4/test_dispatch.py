@@ -13,14 +13,13 @@ from .dispatch import SingleRankMxfp8Dispatch
 from .workspace import WorkspaceConfig, make_workspace_plan
 
 
-def _config(dispatch_dedup=False) -> WorkspaceConfig:
+def _config(hidden=128) -> WorkspaceConfig:
     return WorkspaceConfig(
         world_size=1,
-        dispatch_dedup=dispatch_dedup,
         num_topk=2,
         num_experts_per_rank=4,
         max_tokens_per_rank=8,
-        hidden=128,
+        hidden=hidden,
         intermediate=128,
         token_padding_block=64,
         sf_padding_block=128,
@@ -35,25 +34,29 @@ def _metadata(token: int, topk: int) -> int:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("num_sms", [1, 4])
 @pytest.mark.parametrize(
-    "dispatch_dedup,local_counts,overlap",
+    "local_counts,hidden,scale_offset",
     [
-        (False, False, False),
-        (True, False, False),
-        (False, True, False),
-        (False, False, True),
-        (False, True, True),
-        (True, True, False),
+        (False, 128, 0),
+        (True, 128, 0),
+        (False, 4096, 0),
+        (True, 6400, 0),
+        (False, 512, 4),
+        (True, 512, 4),
     ],
 )
 def test_single_rank_dispatch_compacts_mxfp8_routes_on_device(
-    num_sms, dispatch_dedup, local_counts, overlap, monkeypatch
+    num_sms,
+    local_counts,
+    hidden,
+    scale_offset,
+    monkeypatch,
 ) -> None:
     major, _ = torch.cuda.get_device_capability()
     if major != 10:
         pytest.skip("requires an SM100-class B200")
 
     monkeypatch.setenv("FLASHINFER_MXFP8_MXFP4_WAIT_STATS", "1")
-    config = _config(dispatch_dedup)
+    config = _config(hidden)
     plan = make_workspace_plan(config)
     device = torch.device("cuda")
     local_bytes = torch.zeros(plan.local.total_bytes, dtype=torch.uint8, device=device)
@@ -94,6 +97,14 @@ def test_single_rank_dispatch_compacts_mxfp8_routes_on_device(
         .to(torch.uint8)
         .reshape(config.max_tokens_per_rank, config.sf_uint32_per_token * 4)
     )
+    if scale_offset:
+        backing = torch.empty(
+            scale_bytes.numel() + scale_offset, dtype=torch.uint8, device=device
+        )
+        unaligned = backing[scale_offset:].view_as(scale_bytes)
+        unaligned.copy_(scale_bytes)
+        scale_bytes = unaligned
+        assert scale_bytes.data_ptr() % 16 == scale_offset
     scales = scale_bytes.view(torch.float8_e8m0fnu)
     route_ids = torch.full(
         (config.max_tokens_per_rank, config.num_topk),
@@ -115,7 +126,6 @@ def test_single_rank_dispatch_compacts_mxfp8_routes_on_device(
         config,
         num_sms=num_sms,
         cta_local_counts=local_counts,
-        overlap_dispatch_pull=overlap,
     ).compile(
         partition,
         activation,
@@ -126,14 +136,6 @@ def test_single_rank_dispatch_compacts_mxfp8_routes_on_device(
     )
     products()
     torch.cuda.synchronize()
-
-    if dispatch_dedup:
-        from .wait_stats_config import SLOTS, STATS_WORDS, Slot
-
-        fetched = partition.local["wait_stats"][:STATS_WORDS].reshape(-1, SLOTS)[
-            :, Slot.DISPATCH_FETCH_COUNT
-        ]
-        assert fetched.sum().item() == 4
 
     # Pool rows are expert-major; within an expert the stable order is the
     # original (token, top-k slot) scan order.  Expert 3 is empty.
@@ -153,12 +155,17 @@ def test_single_rank_dispatch_compacts_mxfp8_routes_on_device(
             assert int(metadata[pool_row].item()) == _metadata(token, topk)
             actual_score = products.compatibility_route_scores[pool_row].item()
             assert actual_score == pytest.approx(route_scores[token, topk].item())
-            # hidden=128 has one uint32 SF atom per token.  At the start of
-            # each expert's 128-row SF block, token positions map to 0,4,8...
+            # Each K atom occupies 128 words; this token's scale words are
+            # 512 bytes apart in the swizzled pool, including H=6400 tails.
             sf_row = (start // 64) * 128
-            sf_index = (sf_row // 128) * 128 + position * 4
-            actual_sf = scale_pool[sf_index : sf_index + 1].view(torch.uint8).cpu()
-            torch.testing.assert_close(actual_sf, scale_bytes[token].cpu())
+            for k_atom in range(config.sf_uint32_per_token):
+                sf_index = (
+                    (sf_row // 128) * config.sf_uint32_per_token + k_atom
+                ) * 128 + position * 4
+                actual_sf = scale_pool[sf_index : sf_index + 1].view(torch.uint8).cpu()
+                torch.testing.assert_close(
+                    actual_sf, scale_bytes[token, k_atom * 4 : (k_atom + 1) * 4].cpu()
+                )
 
     torch.testing.assert_close(
         products.fc1_ready_counters[:3].cpu(),
@@ -229,45 +236,3 @@ def test_dispatch_rejects_distributed_configuration() -> None:
     distributed = WorkspaceConfig(**{**config.__dict__, "world_size": 2})
     with pytest.raises(NotImplementedError, match="world_size=1"):
         SingleRankMxfp8Dispatch(distributed)
-
-
-def test_round_robin_inverse_matches_enumeration():
-    import random
-    from .dispatch_dedup import round_robin_slot
-
-    rng = random.Random(1234)
-    for world in (1, 2, 4, 16):
-        for _ in range(100):
-            counts = [rng.randrange(20) for _ in range(world)]
-            order = [
-                (rank, slot)
-                for slot in range(max(counts))
-                for rank, count in enumerate(counts)
-                if slot < count
-            ]
-            for position, (rank, slot) in enumerate(order):
-                assert round_robin_slot(counts, rank, slot) == position
-
-
-@pytest.mark.parametrize(
-    "experts",
-    [
-        [7, 2, 5, 0, 6, 3, 1, 4],
-        [-1, 18, 7, -1, 1, 19, 6, 0],
-        [-1] * 8,
-        [2, 2, 0, -1, 2, 0, 1, 1],
-    ],
-)
-def test_sibling_chains_cover_routes_once(experts):
-    from .dispatch_dedup import sibling_chains
-
-    chains = sibling_chains(experts, 8)
-    assert sorted(k for chain in chains for k in chain) == [
-        k for k, expert in enumerate(experts) if expert >= 0
-    ]
-    assert len(chains) == len({expert // 8 for expert in experts if expert >= 0})
-    for chain in chains:
-        assert len({experts[k] // 8 for k in chain}) == 1
-        assert [(experts[k], k) for k in chain] == sorted(
-            (experts[k], k) for k in chain
-        )

@@ -1005,8 +1005,13 @@ class TokenInPullTokenBackPush:
                     )
                 cute.arch.sync_warp()
 
+                # Exclusive pull ranges: SF_Load
+                # and Weight_LDG cover load issue only; their latency surfaces
+                # in SF_Weight_STG, the first use. TMA_Wait is the row load's
+                # remaining mbarrier wait; the outer TMA_NVLink_Roundtrip spans
+                # issue to completion.
                 if _iket_pull_emit:
-                    _iket.range_push("Pull.SF_LDG_STG")
+                    _iket.range_push("Pull.SF_Load")
 
                 sf_token_in_pool_axis = (
                     expert_sf_pool_block_offset * Int32(self.sf_padding_block)
@@ -1037,6 +1042,9 @@ class TokenInPullTokenBackPush:
                         )
                         sf_vals[i] = ldg_b32_raw(sf_addr)
 
+                if _iket_pull_emit:
+                    _iket.range_pop()  # Pull.SF_Load
+                    _iket.range_push("Pull.Weight_LDG")
                 weight = Float32(0.0)
                 if lane_idx == Int32(0):
                     weight_addr = (
@@ -1049,8 +1057,8 @@ class TokenInPullTokenBackPush:
                     weight = ldg_f32_raw(weight_addr)
 
                 if _iket_pull_emit:
-                    _iket.range_pop()  # Pull.SF_LDG_STG  (= LD phase)
-                    _iket.range_push("Pull.Weight_LDG")  # (= ST phase)
+                    _iket.range_pop()  # Pull.Weight_LDG
+                    _iket.range_push("Pull.SF_Weight_STG")
 
                 for i in cutlass.range_constexpr(0, sf_passes, 1):
                     j = Int32(i * self.warp_threads) + lane_idx
@@ -1072,6 +1080,9 @@ class TokenInPullTokenBackPush:
                 if lane_idx == Int32(0):
                     fc1_input_topk_weights_buffer[pool_token_idx] = weight
 
+                if _iket_pull_emit:
+                    _iket.range_pop()  # Pull.SF_Weight_STG
+                    _iket.range_push("Pull.TMA_Wait")
                 with cute.arch.elect_one():
                     cute.arch.mbarrier_arrive_and_expect_tx(
                         pull_mbar_ptr + warp_idx, Int32(self.hidden_bytes)
@@ -1082,7 +1093,7 @@ class TokenInPullTokenBackPush:
                     )
 
                 if _iket_pull_emit:
-                    _iket.range_pop()  # Pull.Weight_LDG (ST phase)
+                    _iket.range_pop()  # Pull.TMA_Wait
                     _iket.range_pop()  # Pull.TMA_NVLink_Roundtrip (outer)
                     _iket.range_push("Pull.TMA_Store")
 
@@ -1099,6 +1110,8 @@ class TokenInPullTokenBackPush:
                         Int32(self.hidden_bytes),
                     )
 
+                if _iket_pull_emit:
+                    _iket.range_push("Pull.Metadata_STG")
                 with cute.arch.elect_one():
                     TokenSrcMetadata(
                         src_rank=current_rank_in_expert_idx,
@@ -1108,6 +1121,8 @@ class TokenInPullTokenBackPush:
                         token_src_metadata.iterator
                         + Int64(pool_token_idx) * Int64(TokenSrcMetadata.nbytes)
                     )
+                if _iket_pull_emit:
+                    _iket.range_pop()  # Pull.Metadata_STG
 
                 with cute.arch.elect_one():
                     cute.arch.cp_async_bulk_commit_group()
@@ -1136,6 +1151,17 @@ class TokenInPullTokenBackPush:
 
                 if _iket_pull_emit:
                     _iket.range_pop()  # Pull.Arrival_Atomic
+                # Pull progress on every dispatch warp: an instant per token,
+                # followed by one instant per set bit of its local expert.
+                if lane_idx == Int32(0):
+                    _iket.range_push("Pull.TokenDone")
+                    _iket.range_pop()
+                    for bit in cutlass.range_constexpr(
+                        max(1, (self.num_experts_per_rank - 1).bit_length())
+                    ):
+                        if (current_expert_idx >> Int32(bit)) & Int32(1) != Int32(0):
+                            _iket.range_push(f"expert_b{bit}")
+                            _iket.range_pop()
 
                 phase_bit = phase_bit ^ Int32(1)
 

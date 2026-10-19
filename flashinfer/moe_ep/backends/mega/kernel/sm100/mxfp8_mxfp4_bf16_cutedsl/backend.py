@@ -130,6 +130,7 @@ class Mxfp8Mxfp4CutedslMegaKernelBackend(MegaKernelBackend):
             gate_up_clamp=cfg.gate_up_clamp,
             knobs=knobs,
             capacity_tactics=capacity,
+            output_mode=cfg.output_mode,
         )
 
     def validate_forward(
@@ -237,6 +238,17 @@ class Mxfp8Mxfp4CutedslMegaKernelBackend(MegaKernelBackend):
             return output
         return view
 
+    def output_shape(
+        self, num_tokens: int, fleet_params: FleetParams
+    ) -> tuple[int, ...]:
+        if self._kernel_config.output_mode == "per_route":
+            return (
+                num_tokens,
+                self._kernel_config.top_k,
+                fleet_params.token_hidden_size,
+            )
+        return super().output_shape(num_tokens, fleet_params)
+
     def _workspace_pool_key(self, fleet_params: FleetParams) -> Any:
         if self._kernel_config.knobs == "auto":
             return None
@@ -255,6 +267,7 @@ class Mxfp8Mxfp4CutedslMegaKernelBackend(MegaKernelBackend):
             fleet_params.token_hidden_size,
             cfg.intermediate_size,
             cfg.gate_up_clamp,
+            cfg.output_mode,
             knobs_pool_key(self._resolved_tactic(fleet_params)),
         )
 
@@ -278,12 +291,11 @@ __all__ = ["Mxfp8Mxfp4CutedslMegaKernelBackend"]
 try:
     from ......cute_dsl.megamoe.mxfp8_mxfp4.persistent_kernel import (
         ASSEMBLY_READY as _ASSEMBLY_READY,
-        PersistentMxfp8Mxfp4KernelAdapter as _PersistentKernelAdapter,
     )
 except ImportError:
     _ASSEMBLY_READY = False
 
-if _ASSEMBLY_READY and _PersistentKernelAdapter is not None:
+if _ASSEMBLY_READY:
     from ......core.kernel.registry import register_mega_kernel
 
     register_mega_kernel(KERNEL_NAME)(Mxfp8Mxfp4CutedslMegaKernelBackend)

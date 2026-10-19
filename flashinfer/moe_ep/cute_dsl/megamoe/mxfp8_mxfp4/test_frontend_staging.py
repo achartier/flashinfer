@@ -81,6 +81,22 @@ def _config(**updates):
     return FrontendConfig(**values)
 
 
+def test_per_route_shape_validation_and_compile_identity():
+    combined = _config()
+    routes = _config(output_mode="per_route")
+    spec = _spec()
+    route_spec = replace(spec, output=_FakeTensor(2000, (16, 2, 128), torch.bfloat16))
+    frontend.validate_launch_spec(combined, spec)
+    frontend.validate_launch_spec(routes, route_spec)
+    assert frontend.compile_cache_key(combined, spec) != frontend.compile_cache_key(
+        routes, spec
+    )
+    with pytest.raises(ValueError, match="output must be BF16"):
+        frontend.validate_launch_spec(routes, spec)
+    with pytest.raises(ValueError, match="output must be BF16"):
+        frontend.validate_launch_spec(combined, route_spec)
+
+
 def _spec(pointer_offset=0, stream=17):
     ptr = iter(range(1000 + pointer_offset, 1020 + pointer_offset))
     return KernelLaunchSpec(
@@ -314,3 +330,15 @@ def test_prequantized_staging_is_bit_exact_and_masks_tail(monkeypatch):
     assert torch.equal(ids_out[:2], ids.to(torch.int64))
     assert torch.equal(scores_out[:2], scores)
     assert (ids_out[2:] == -1).all()
+
+
+def test_compile_cache_distinguishes_persistent_clusters() -> None:
+    config, spec = _config(), _spec()
+    keys = [
+        frontend.compile_cache_key(
+            replace(config, tactic=(("persistent_clusters", clusters),)),
+            replace(spec, static_tactic=(("persistent_clusters", clusters),)),
+        )
+        for clusters in (None, 64, 72)
+    ]
+    assert len(set(keys)) == 3

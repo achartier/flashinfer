@@ -79,6 +79,7 @@ class Slot(IntEnum):
     DISPATCH_SYNC_SEND_NS = 37
     DISPATCH_NVLINK_BARRIER_NS = 38
     SCHED_LATE_CLAIM_NS = 39
+    # Retired with dispatch_dedup; kept so later slot numbers stay stable.
     DISPATCH_FETCH_COUNT = 40
     TAIL_DRAIN_BARRIER_NS = 41
     TAIL_SHARED_RESET_NS = 42
@@ -95,6 +96,7 @@ class Slot(IntEnum):
     DISPATCH_COUNT_SEND_NS = 47
     DISPATCH_RENDEZVOUS_NS = 48
     DISPATCH_COUNT_SUM_NS = 49
+    # Retired with the start-up prefetch; kept so slot numbers stay stable.
     TMA_A_STARTUP_PREFETCH_NS = 50
     # Round-7 start-up split of the NVLink barrier (mega only). CTA 0 alone:
     # dispatch-prep start to its cross-rank signal send (prep, first grid
@@ -106,9 +108,12 @@ class Slot(IntEnum):
     STARTUP_LOCAL_ARRIVAL_AT_NS = 51
     STARTUP_SIGNAL_WAIT_NS = 52
     STARTUP_GRID_SYNC_NS = 53
+    # Last launch snapshot, overwritten before the first grid rendezvous.
+    STARTUP_PHASE_RAW = 54
+    MMA_OPERAND_FULL_FC2_NS = 55
 
 
-SLOTS = 54
+SLOTS = 56
 STATS_WORDS = MAX_CTAS * SLOTS
 # Mega only: a per-launch ring after the per-CTA block. Word 0 counts
 # launches; entry i (words 1 + 3 i ...) holds (launch number + 1, local

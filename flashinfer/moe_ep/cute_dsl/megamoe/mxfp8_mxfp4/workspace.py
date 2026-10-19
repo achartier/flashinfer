@@ -148,9 +148,6 @@ class WorkspaceConfig:
     sf_padding_block: int
     cluster_tile_tokens: int
     load_balance_mode: Literal["static", "atomic_counter", "alternating"] = "static"
-    dispatch_dedup: bool = False
-    token_back_by_dispatch: bool = False
-    token_back_schedule_mode: Literal["static", "atomic_counter"] = "static"
 
     def __post_init__(self) -> None:
         positive = {
@@ -167,16 +164,6 @@ class WorkspaceConfig:
         for name, value in positive.items():
             if value <= 0:
                 raise ValueError(f"{name} must be positive, got {value}")
-        if self.dispatch_dedup and (
-            self.max_tokens_per_rank
-            * self.num_topk
-            * self.num_experts_per_rank
-            * self.world_size
-            >= 2**31
-        ):
-            raise ValueError(
-                "dispatch_dedup table and sibling indices must fit signed int32"
-            )
         if self.num_topk > 32:
             raise ValueError("num_topk must be at most 32")
         if self.hidden % MXFP8_SF_VEC_SIZE:
@@ -193,8 +180,6 @@ class WorkspaceConfig:
             )
         if self.load_balance_mode not in ("static", "atomic_counter", "alternating"):
             raise ValueError("unsupported load_balance_mode")
-        if self.token_back_schedule_mode not in ("static", "atomic_counter"):
-            raise ValueError("unsupported token_back_schedule_mode")
 
     @property
     def num_total_experts(self) -> int:
@@ -257,12 +242,6 @@ def local_region_specs(config: WorkspaceConfig) -> tuple[RegionSpec, ...]:
         _region("expert_send_count", "int64", 8, (config.num_total_experts,)),
         _region("fc1_done_counter", "int32", 4, (config.fc1_done_slots,)),
     ]
-    if config.token_back_by_dispatch:
-        specs.append(
-            _region("fc2_done_counter", "int32", 4, (config.num_experts_per_rank,))
-        )
-        if config.token_back_schedule_mode == "atomic_counter":
-            specs.append(_region("token_back_schedule_counter", "int32", 4, (1,)))
     if config.load_balance_mode != "static":
         # Alternating uses independent FC1/FC2 counters. Both live in the
         # zero-prefix region reset by the kernel tail on every replay.
@@ -296,10 +275,6 @@ def local_region_specs(config: WorkspaceConfig) -> tuple[RegionSpec, ...]:
             ),
         ]
     )
-    if config.token_back_by_dispatch:
-        specs.append(
-            _region("fc2_output_workspace", "bfloat16", 2, (pool, config.hidden), 128)
-        )
     from .wait_stats_config import MEGA_STATS_WORDS, wait_stats_enabled
 
     if wait_stats_enabled():
@@ -325,18 +300,6 @@ def shared_region_specs(config: WorkspaceConfig) -> tuple[RegionSpec, ...]:
             "int32",
             4,
             (config.num_experts_per_rank, config.world_size, max_slot),
-        ),
-        *(
-            (
-                _region(
-                    "src_sibling_idx",
-                    "int32",
-                    4,
-                    (config.num_experts_per_rank, config.world_size, max_slot),
-                ),
-            )
-            if config.dispatch_dedup
-            else ()
         ),
         _region("nvlink_barrier_signal", "int32", 4, (NVLINK_SIGNAL_SLOT_COUNT,)),
     )

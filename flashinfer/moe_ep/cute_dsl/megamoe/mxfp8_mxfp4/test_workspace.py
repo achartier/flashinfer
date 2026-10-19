@@ -129,47 +129,6 @@ def test_binding_instantiates_existing_helper_contract() -> None:
     assert captured["token_back_reduce_topk"] is False
 
 
-def test_token_back_counter_and_publish_sizing() -> None:
-    config = _config(
-        token_back_by_dispatch=True,
-        token_back_schedule_mode="atomic_counter",
-    )
-    plan = make_workspace_plan(config)
-    assert plan.local.region("fc2_done_counter").spec.shape == (8,)
-    assert plan.local.region("token_back_schedule_counter").spec.shape == (1,)
-    assert plan.local.region("fc2_output_workspace").spec.dtype == "bfloat16"
-
-    binding = make_token_comm_binding(
-        config,
-        cluster_shape_mn=(2, 1),
-        dispatch_warp_start=8,
-        num_other_warps=8,
-        token_back_standalone=True,
-        fc2_n_tile=256,
-    )
-    assert binding.fc2_publishes_per_token_cluster_tile == 56
-
-
 def test_rejects_non_atom_aligned_sf_padding() -> None:
     with pytest.raises(ValueError, match="multiple of 128"):
         _config(sf_padding_block=224)
-
-
-def test_dispatch_dedup_workspace_is_optional_and_outside_reset_prefix():
-    baseline = make_workspace_plan(_config())
-    plan = make_workspace_plan(_config(dispatch_dedup=True))
-    with pytest.raises(KeyError):
-        baseline.shared.region("src_sibling_idx")
-    sibling = plan.shared.region("src_sibling_idx")
-    source = plan.shared.region("src_token_topk_idx")
-    assert sibling.spec.shape == source.spec.shape
-    assert sibling.offset >= plan.shared.zero_prefix_bytes
-    assert plan.local == baseline.local
-    # Linear links support slots above 65535 without truncation.
-    large = _config(dispatch_dedup=True, max_tokens_per_rank=32768)
-    assert (
-        make_workspace_plan(large).shared.region("src_sibling_idx").spec.shape[-1]
-        == 131072
-    )
-    with pytest.raises(ValueError, match="sibling indices"):
-        _config(dispatch_dedup=True, max_tokens_per_rank=2**28)

@@ -25,19 +25,16 @@ from flashinfer.moe_ep.cute_dsl.megamoe.mxfp8_mxfp4.workspace import (
 )
 
 
-@pytest.mark.parametrize("mode", ["epi_warps", "reuse_dispatch_warps"])
-@pytest.mark.parametrize("schedule", ["static", "atomic_counter"])
-def test_mxfp8_mxfp4_token_back_tactic_contract(mode, schedule):
-    tactic = resolve_tactic(
-        129, {"token_back_mode": mode, "token_back_schedule_mode": schedule}
+def test_mxfp8_mxfp4_token_back_tactic_contract():
+    assert resolve_tactic(129, {"token_back_mode": "epi_warps"})["token_back_mode"] == (
+        "epi_warps"
     )
-    assert tactic["token_back_mode"] == mode
-    assert tactic["token_back_schedule_mode"] == schedule
 
 
-def test_mxfp8_mxfp4_rejects_standalone_token_back():
-    with pytest.raises(ValueError, match="standalone_warps is unsupported"):
-        resolve_tactic(129, {"token_back_mode": "standalone_warps"})
+@pytest.mark.parametrize("mode", ["reuse_dispatch_warps", "standalone_warps"])
+def test_mxfp8_mxfp4_rejects_other_token_back_modes(mode):
+    with pytest.raises(ValueError, match="token_back_mode must be epi_warps"):
+        resolve_tactic(129, {"token_back_mode": mode})
 
 
 def _scheduler() -> PersistentFc1Fc2Scheduler:
@@ -133,8 +130,6 @@ def test_mxfp8_mxfp4_megamoe_workspace_scale_sideband_and_alignment() -> None:
         sf_padding_block=128,
         cluster_tile_tokens=128,
         load_balance_mode="atomic_counter",
-        token_back_by_dispatch=True,
-        token_back_schedule_mode="atomic_counter",
     )
     plan = make_workspace_plan(config)
     for layout in (plan.local, plan.shared):

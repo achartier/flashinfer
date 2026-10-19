@@ -9,11 +9,11 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import dsl_user_op
 
 
-def fc2_exchange_words(epilogue_warps: int, mode: str) -> int:
+def fc2_exchange_words(epilogue_warps: int) -> int:
     # FC1 needs 32 FP32 maxima per warp. FC2 aliases that storage only after
-    # the tile boundary, staging 16 x 32 BF16 values per warp. Both modes
-    # reuse the tile for the second half of each 32-token group.
-    return epilogue_warps * (32 if mode == "direct" else 256)
+    # the tile boundary, staging 16 x 32 BF16 values per warp, reused for the
+    # second half of each 32-token group.
+    return epilogue_warps * 256
 
 
 @dsl_user_op
@@ -60,12 +60,11 @@ def stage_native_bf16(
     lane,
     half: cutlass.Constexpr[int],
     chunk: cutlass.Constexpr[int],
-    mode: cutlass.Constexpr[str],
 ):
     """Round 16 token columns once and stage one native 16-feature half.
 
-    Both modes reuse a 16-row tile between chunks to retain the N128
-    operand depth. staged256 shares those rows across its four warps.
+    A 16-row tile is reused between chunks to retain the N128 operand depth;
+    the four warps of a warpgroup share its rows.
     """
     bf16 = cute.make_rmem_tensor((8,), cutlass.BFloat16)
     for i in cutlass.range_constexpr(8):
@@ -73,12 +72,8 @@ def stage_native_bf16(
     packed = cute.recast_tensor(bf16, cutlass.Uint32)
     token = lane % 8 + (lane // 16) * 8
     feature = (lane // 8 % 2) * 8 + half * 16
-    if cutlass.const_expr(mode == "staged64"):
-        offset = warp * 1024 + token * 64 + feature * 2
-        mask = 0x30
-    else:
-        offset = (warp // 4) * 4096 + token * 256 + (warp % 4) * 64 + feature * 2
-        mask = 0x70
+    offset = (warp // 4) * 4096 + token * 256 + (warp % 4) * 64 + feature * 2
+    mask = 0x70
     store_native_bf16(staging, offset, packed[0], packed[1], packed[2], packed[3], mask)
 
 

@@ -472,16 +472,17 @@ class MoEEpMegaLayer(nn.Module):
             )
 
         caller_output = t.output
+        output_shape = self._kernel.output_shape(t.num_tokens, fleet_params)
         if caller_output is not None and (
             caller_output.dtype != torch.bfloat16
             or caller_output.device != t.hidden_states.device
-            or caller_output.ndim != 2
+            or caller_output.ndim != len(output_shape)
             or caller_output.shape[0] < t.num_tokens
-            or caller_output.shape[1] != fleet_params.token_hidden_size
+            or tuple(caller_output.shape[1:]) != output_shape[1:]
         ):
             raise MoEEpConfigError(
                 "MegaMoE caller output must be a bf16 CUDA tensor with shape "
-                f"at least ({t.num_tokens}, {fleet_params.token_hidden_size}); "
+                f"at least {output_shape} along the token dimension; "
                 f"got shape={tuple(caller_output.shape)}, "
                 f"dtype={caller_output.dtype}, device={caller_output.device}"
             )
@@ -556,6 +557,10 @@ class MoEEpMegaLayer(nn.Module):
         ``return_workspace_view=True`` explicitly opts into a borrowed view on
         backends that support one. A view remains valid under stream ordering
         until the next launch reuses the pooled physical workspace.
+
+        The MXFP8/MXFP4 backend's ``output_mode="per_route"`` returns BF16
+        ``[num_tokens, top_k, hidden]`` unweighted route terms; its default
+        ``"combined"`` mode returns weighted BF16 ``[num_tokens, hidden]``.
         """
         if return_workspace_view and t.output is not None:
             raise MoEEpConfigError(
@@ -589,8 +594,7 @@ class MoEEpMegaLayer(nn.Module):
             # (allocator work between stage and compute can sync the device
             # mid-round).
             output = torch.empty(
-                t.num_tokens,
-                fleet_params.token_hidden_size,
+                self._kernel.output_shape(t.num_tokens, fleet_params),
                 dtype=torch.bfloat16,
                 device=t.hidden_states.device,
             )

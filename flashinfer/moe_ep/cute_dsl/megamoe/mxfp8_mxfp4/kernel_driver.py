@@ -15,7 +15,6 @@ Multi-rank transport never changes the native MMA/epilogue implementation.
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -71,7 +70,6 @@ class DriverViews:
     route_store: Any
     fc1_done_counter: Any
     token_metadata: Any = None
-    fc2_done_counter: Any = None
 
 
 class PersistentM128DeviceDriver:
@@ -84,8 +82,6 @@ class PersistentM128DeviceDriver:
         epilogue_registers: int | None = None,
         task_registers: int = 72,
         stats_word_offset=None,
-        startup_prefetch_waves: int = 0,
-        startup_prefetch_clusters: int = 1,
     ) -> None:
         staging = kernel_pipelines.staging
         dispatch_phase = kernel_pipelines.dispatch_phase
@@ -113,8 +109,6 @@ class PersistentM128DeviceDriver:
                 raise ValueError(
                     "warp-group register counts exceed the SM register file"
                 )
-        self.startup_prefetch_waves = startup_prefetch_waves
-        self.startup_prefetch_clusters = startup_prefetch_clusters
         self.two_cta = two_cta
         self.kernel_pipelines = kernel_pipelines
         self.staging = staging
@@ -130,13 +124,6 @@ class PersistentM128DeviceDriver:
         self.iket = iket_enabled()
         self._iket: Any = load_iket() if self.iket else None
         self.iket_fine_ctas = iket_fine_ctas()
-        # Issue each MMA with N = the tile's valid tokens rounded up to 16
-        # (dynamic_mainloop) instead of the full static N tile.
-        # ``FLASHINFER_MXFP8_MXFP4_DYNAMIC_N=0`` selects the static
-        # full-N ``cute.gemm`` path for A/B comparisons.
-        self.dynamic_n = (
-            os.environ.get("FLASHINFER_MXFP8_MXFP4_DYNAMIC_N", "1").strip() != "0"
-        )
         self.wait_stats = wait_stats_enabled() and (
             dispatch_phase is None or stats_word_offset is not None
         )
@@ -183,66 +170,6 @@ class PersistentM128DeviceDriver:
             if cute.arch.lane_idx() == Int32(0):
                 stat_add(stats_slot_ptr(stats, slot, self.stats_word_offset), value)
 
-    @staticmethod
-    @cute.jit
-    def _prefetch_tma(atom, source, descriptor_ptr) -> None:
-        """TMA L2 prefetch of one k-tile, honoring a rewritten descriptor."""
-
-        if cutlass.const_expr(descriptor_ptr is None):
-            cute.prefetch(atom, source)
-        else:
-            # cute.prefetch has no tma_desc_ptr argument; unpack the atom the
-            # same way cute.copy does for a rewritten descriptor.
-            from cutlass._mlir.dialects import cute as _cute_ir
-
-            value = atom._unpack(
-                tma_bar_ptr=cute.make_ptr(cutlass.Int64, 0, cute.AddressSpace.smem),
-                tma_desc_ptr=descriptor_ptr,
-                mcast_mask=cutlass.Int16(0),
-            )
-            _cute_ir.prefetch(value, [source.value])
-
-    @cute.jit
-    def _prefetch_weights(self, phase, sources, k_tile) -> None:
-        self._prefetch_tma(
-            phase.atoms[0], sources[0][(None, k_tile)], phase.descriptor_ptrs[0]
-        )
-        self._prefetch_tma(
-            phase.atoms[2], sources[2][(None, k_tile)], phase.descriptor_ptrs[2]
-        )
-
-    @cute.jit
-    def _startup_prefetch_weights(self, phase, k_tiles) -> None:
-        """Prefetch a unique weight prefix while dispatch publishes counts.
-
-        Predict one token block per expert. Empty experts or additional token
-        blocks affect usefulness only: no data or completion flag is changed.
-        The TMA partitions already select each CTA's half of a pair tile.
-        """
-        _, _, cluster = cute.arch.block_idx()
-        cta_rank = cute.arch.block_idx_in_cluster()
-        pair = 2 if self.two_cta else 1
-        linear = cluster * Int32(pair) + cta_rank
-        feature_blocks = cute.size(phase.global_partitions[0], mode=[1])
-        experts = cute.size(phase.global_partitions[0], mode=[3])
-        with cute.arch.elect_one():
-            for wave in cutlass.range_constexpr(self.startup_prefetch_waves):
-                tile = linear // Int32(pair) + Int32(
-                    wave * self.startup_prefetch_clusters
-                )
-                expert = tile // Int32(feature_blocks)
-                feature = tile % Int32(feature_blocks)
-                if expert < Int32(experts):
-                    sources = self.staging.slice_tma_sources(
-                        global_a=phase.global_partitions[0],
-                        global_b=phase.global_partitions[1],
-                        global_sfa=phase.global_partitions[2],
-                        global_sfb=phase.global_partitions[3],
-                        tile_mnl=(feature * Int32(pair) + cta_rank, Int32(0), expert),
-                    )
-                    for k_tile in cutlass.range(0, k_tiles, 1, unroll=1):
-                        self._prefetch_weights(phase, sources, k_tile)
-
     @cute.jit
     def _run_scheduler(self, scheduler, stats=None, entry=None) -> None:
         if cutlass.const_expr(stats is not None):
@@ -285,7 +212,7 @@ class PersistentM128DeviceDriver:
         bidx, _, _ = cute.arch.block_idx()
         mma_v = bidx % cute.size(self.staging.tiled_mma.thr_id.shape)
         data_row = work.cumulative_data_physical_row
-        if cutlass.const_expr(self.two_cta and self.dynamic_n):
+        if cutlass.const_expr(self.two_cta):
             # The hardware splits a dynamic-N 2-CTA MMA at align16(valid)/2
             # rows, while the TMA partition splits the static tile at N/2:
             # shift the non-leader's token rows to the hardware split.
@@ -386,16 +313,6 @@ class PersistentM128DeviceDriver:
         fc2_k_tiles,
         stats=None,
     ) -> None:
-        if cutlass.const_expr(self.startup_prefetch_waves > 0):
-            if cutlass.const_expr(stats is not None):
-                prefetch_start = globaltimer_lo()
-            self._startup_prefetch_weights(views.fc1, Int32(fc1_k_tiles))
-            if cutlass.const_expr(stats is not None):
-                self._record(
-                    stats,
-                    Slot.TMA_A_STARTUP_PREFETCH_NS,
-                    globaltimer_lo() - prefetch_start,
-                )
         if cutlass.const_expr(stats is not None):
             consume_start = globaltimer_lo()
         work = consumer.consume_work()
@@ -553,6 +470,21 @@ class PersistentM128DeviceDriver:
                                 Slot.TMA_B_FIRST_FC2_START_NS,
                                 waited - loop_start,
                             )
+            if cutlass.const_expr(self.iket):
+                # Per-expert readiness of the first FC1 token tile as this CTA
+                # sees it (after its wait, or at once for a peeked tile): an
+                # instant, followed by one instant per set bit of the expert
+                # index (IKET allows about 30 range names per kernel; the pull
+                # tags its per-token instants with the same bit names).
+                if work.phase == Int32(DevicePhase.FC1) and work.tile_n_idx == Int32(0):
+                    self._iket.range_push("fc1_ready")
+                    self._iket.range_pop()
+                    for bit in cutlass.range_constexpr(
+                        max(1, (scheduler_params.expert_count - 1).bit_length())
+                    ):
+                        if (work.expert_idx >> Int32(bit)) & Int32(1) != Int32(0):
+                            self._iket.range_push(f"expert_b{bit}")
+                            self._iket.range_pop()
             if cutlass.const_expr(stats is not None):
                 if work.phase == Int32(DevicePhase.FC2):
                     first_fc2 = Int32(0)
@@ -671,11 +603,10 @@ class PersistentM128DeviceDriver:
                     k_tiles = Int32(fc1_k_tiles)
                 else:
                     k_tiles = Int32(fc2_k_tiles)
-                if cutlass.const_expr(self.dynamic_n):
-                    # The issuer's contract is 1..N valid tokens.
-                    mma_tokens = work.valid_tokens_in_cta_tile
-                    if mma_tokens < Int32(1):
-                        mma_tokens = Int32(1)
+                # The issuer's contract is 1..N valid tokens.
+                mma_tokens = work.valid_tokens_in_cta_tile
+                if mma_tokens < Int32(1):
+                    mma_tokens = Int32(1)
                 for k_tile in cutlass.range(0, k_tiles, 1, unroll=1):
                     if cutlass.const_expr(stats is not None):
                         operand_wait = globaltimer_lo()
@@ -687,11 +618,12 @@ class PersistentM128DeviceDriver:
                         if fine_cta:
                             self._iket.range_pop()
                     if cutlass.const_expr(stats is not None):
-                        self._record(
-                            stats,
-                            Slot.MMA_OPERAND_FULL_NS,
-                            globaltimer_lo() - operand_wait,
-                        )
+                        operand_elapsed = globaltimer_lo() - operand_wait
+                        self._record(stats, Slot.MMA_OPERAND_FULL_NS, operand_elapsed)
+                        if work.phase == Int32(DevicePhase.FC2):
+                            self._record(
+                                stats, Slot.MMA_OPERAND_FULL_FC2_NS, operand_elapsed
+                            )
                     ab_full = cutlass.Boolean(1)
                     if k_tile + 1 < k_tiles:
                         ab_full = ab_consumer.try_wait()
@@ -705,34 +637,22 @@ class PersistentM128DeviceDriver:
                     tile_b = (None, None, None, ab_handle.index)
                     # Token columns are independent, and the epilogue masks
                     # stores using valid_tokens_in_cta_tile, so columns beyond the
-                    # valid tokens never affect live results.  The dynamic issuer
-                    # computes only the valid columns (rounded up to 16); the
-                    # static path issues the complete N tile through CuTe's
-                    # native block-scaled MMA.
-                    if cutlass.const_expr(self.dynamic_n):
-                        issue_dynamic_block_scaled_mma_tile(
-                            acc_tensor=acc,
-                            a_frag_tile=frag_a[tile_a],
-                            b_frag_tile=frag_b[tile_b],
-                            sfa_tensor=tmem_sfa,
-                            sfb_tensor=mma_sfb,
-                            k_tile_idx=k_tile,
-                            valid_tokens_in_tile=mma_tokens,
-                            a_dtype=self.staging.weight_dtype,
-                            b_dtype=self.staging.activation_dtype,
-                            sf_dtype=self.staging.scale_dtype,
-                            sf_vec_size=SF_VEC_SIZE,
-                            mma_tiler_mnk=self.staging.mma_tiler,
-                        )
-                    else:
-                        tiled_mma.set(tcgen05.Field.ACCUMULATE, k_tile != 0)
-                        cute.gemm(
-                            tiled_mma,
-                            acc,
-                            [frag_a[tile_a], tmem_sfa],
-                            [frag_b[tile_b], mma_sfb],
-                            acc,
-                        )
+                    # valid tokens never affect live results.  Each MMA computes
+                    # only the valid columns, rounded up to 16.
+                    issue_dynamic_block_scaled_mma_tile(
+                        acc_tensor=acc,
+                        a_frag_tile=frag_a[tile_a],
+                        b_frag_tile=frag_b[tile_b],
+                        sfa_tensor=tmem_sfa,
+                        sfb_tensor=mma_sfb,
+                        k_tile_idx=k_tile,
+                        valid_tokens_in_tile=mma_tokens,
+                        a_dtype=self.staging.weight_dtype,
+                        b_dtype=self.staging.activation_dtype,
+                        sf_dtype=self.staging.scale_dtype,
+                        sf_vec_size=SF_VEC_SIZE,
+                        mma_tiler_mnk=self.staging.mma_tiler,
+                    )
                     ab_handle.release()
                 acc_pipeline.producer_commit(acc_state)
                 acc_state.advance()
@@ -764,7 +684,6 @@ class PersistentM128DeviceDriver:
         dispatch_args,
         dispatch_storage,
         epilogue_exchange,
-        fc1_store,
         fc1_k_tiles: int,
         fc2_k_tiles: int,
     ) -> None:
@@ -882,11 +801,9 @@ class PersistentM128DeviceDriver:
                 route_store=views.route_store,
                 fc1_done_counter=views.fc1_done_counter,
                 epilogue_exchange=epilogue_exchange,
-                fc1_store=fc1_store,
                 warp_idx=epilogue_warp_idx,
                 tidx=tidx,
                 token_metadata=views.token_metadata,
-                fc2_done_counter=views.fc2_done_counter,
                 stats=stats,
                 stats_word_offset=self.stats_word_offset,
             )

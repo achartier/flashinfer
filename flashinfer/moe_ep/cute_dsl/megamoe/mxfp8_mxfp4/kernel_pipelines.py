@@ -38,7 +38,6 @@ from .device_epilogue import (
 )
 from .device_scheduler import DeviceSchedulerParams, PersistentDeviceScheduler
 from .dispatch import Mxfp8DispatchPhase
-from .fc1_store import fc1_store_bytes, fc1_store_layout
 from .fc2_store import fc2_exchange_words
 from .scale_tma_staging import Mxfp8Mxfp4TmaStaging
 from .stage_fit import MX_BLOCK_SIZE, OperandStageBytes, StageFit
@@ -275,7 +274,6 @@ class KernelPipelines:
                 scheduler_params=self.scheduler_params,
                 dispatch_phase=self.dispatch_phase,
                 epilogue_warps=len(self.warp_ids.epilogue),
-                fc2_store_mode=self.epilogue.config.fc2_store_mode,
             )
         return self._shared_storage_type
 
@@ -287,7 +285,6 @@ class KernelPipelines:
         scheduler_params: Any,
         dispatch_phase: Optional[Mxfp8DispatchPhase],
         epilogue_warps: int = EPILOGUE_WARPS,
-        fc2_store_mode: str = "direct",
     ) -> type:
         """Compose the control-storage struct for a given operand stage count.
 
@@ -304,8 +301,8 @@ class KernelPipelines:
         num_acc_barriers = num_acc_stages * 2
         if epilogue_warps not in (4, 8):
             raise ValueError("epilogue_warps must be 4 or 8")
-        exchange_words = fc2_exchange_words(epilogue_warps, fc2_store_mode)
-        exchange_alignment = 4 if fc2_store_mode == "direct" else 16
+        exchange_words = fc2_exchange_words(epilogue_warps)
+        exchange_alignment = 16
 
         if dispatch_phase is None:
 
@@ -339,18 +336,6 @@ class KernelPipelines:
             tmem_holding_buf: cutlass.Int32
 
         return SharedStorage
-
-    def allocate_fc1_store_smem(self, smem):
-        """Allocate the store ring before operands, matching the host stage fit."""
-        if not self.epilogue.fc1_tma_store:
-            return None
-        layout = fc1_store_layout(len(self.warp_ids.epilogue) // 4)
-        return smem.allocate_tensor(
-            cutlass.Float8E4M3FN,
-            layout.outer,
-            byte_alignment=128,
-            swizzle=layout.inner,
-        )
 
     def allocate_operand_smem(self, smem) -> OperandSmem:
         """Allocate A/B/SFA/SFB stage tensors with their authoritative layouts."""
@@ -532,12 +517,11 @@ def fit_operand_stages(
     minimum_stages: int = 2,
     maximum_stages: int = 8,
     epilogue_warps: int = EPILOGUE_WARPS,
-    fc2_store_mode: str = "direct",
 ) -> StageFit:
     """Deepest operand pipeline whose dynamic shared memory fits one CTA.
 
     Account for the control struct and its stage-dependent barrier array,
-    operand alignment, optional FC1 store storage, and each operand stage."""
+    operand alignment, epilogue exchange storage, and each operand stage."""
 
     operand = mma_operand_stage_bytes(mma_tiler_mnk)
     for stages in range(maximum_stages, minimum_stages - 1, -1):
@@ -547,12 +531,10 @@ def fit_operand_stages(
             scheduler_params=scheduler_params,
             dispatch_phase=dispatch_phase,
             epilogue_warps=epilogue_warps,
-            fc2_store_mode=fc2_store_mode,
         )
         fixed = -(-storage.__sizeof__() // _OPERAND_SMEM_ALIGNMENT) * (
             _OPERAND_SMEM_ALIGNMENT
         )
-        fixed += fc1_store_bytes(epilogue_warps)
         if fixed + stages * operand.total <= smem_capacity_bytes:
             return StageFit(
                 stages=stages,

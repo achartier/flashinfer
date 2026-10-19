@@ -1,3 +1,6 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Focused host simulation and source-shape checks for the device scheduler."""
 
 import ast
@@ -40,9 +43,12 @@ def _trace(claimer, scheduler):
     return [record.to_words() for record in scheduler.records_for_claimer(claimer)]
 
 
-def test_static_and_atomic_claim_traces_cover_the_same_device_work() -> None:
+@pytest.mark.parametrize("clusters", [3, 64])
+def test_static_and_atomic_claim_traces_cover_the_same_device_work(clusters) -> None:
     """Model the device claim paths against the stable WorkRecord contract."""
-    scheduler = _HOST.PersistentFc1Fc2Scheduler(_config())
+    scheduler = _HOST.PersistentFc1Fc2Scheduler(
+        _config(num_persistent_clusters=clusters)
+    )
     static_records = []
     for cluster_id in range(scheduler.config.num_persistent_clusters):
         static_records.extend(

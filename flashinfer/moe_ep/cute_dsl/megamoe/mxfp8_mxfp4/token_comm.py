@@ -37,10 +37,6 @@ class TokenCommBinding:
     dispatch_warp_start: int
     num_other_warps: int
     flag_batch: int
-    token_back_by_dispatch: bool
-    fc2_publishes_per_token_cluster_tile: int
-    token_back_standalone: bool
-    token_back_schedule_mode: str
     transports_compat_topk_weights: bool = True
     apply_routing_weight_in_fc1: bool = False
     is_swap_ab: bool = True
@@ -59,13 +55,12 @@ class TokenCommBinding:
             "hidden": self.hidden,
             "fc1_token_dtype": fc1_token_dtype,
             "combine_format": combine_format,
-            "token_back_by_dispatch": self.token_back_by_dispatch,
-            "fc2_publishes_per_token_cluster_tile": (
-                self.fc2_publishes_per_token_cluster_tile
-            ),
-            # Scores are deliberately not folded into FC1 or dispatch combine.
+            # The FC2 epilogue writes route terms home; dispatch warps never
+            # push tokens back. Scores are not folded into FC1 or dispatch.
+            "token_back_by_dispatch": False,
+            "fc2_publishes_per_token_cluster_tile": 0,
             "token_back_reduce_topk": False,
-            "token_back_standalone": self.token_back_standalone,
+            "token_back_standalone": False,
             "sf_uint32_per_token": self.sf_uint32_per_token,
             "token_padding_block": self.token_padding_block,
             "sf_padding_block": self.sf_padding_block,
@@ -76,7 +71,7 @@ class TokenCommBinding:
             "is_swap_ab": self.is_swap_ab,
             "sf_atom_swizzled": self.sf_atom_swizzled,
             "flag_batch": self.flag_batch,
-            "token_back_schedule_mode": self.token_back_schedule_mode,
+            "token_back_schedule_mode": "static",
         }
 
     def instantiate(
@@ -102,8 +97,6 @@ def make_token_comm_binding(
     dispatch_warp_start: int,
     num_other_warps: int,
     flag_batch: int = 1,
-    token_back_standalone: bool = False,
-    fc2_n_tile: int | None = None,
 ) -> TokenCommBinding:
     if len(cluster_shape_mn) != 2 or any(v <= 0 for v in cluster_shape_mn):
         raise ValueError("cluster_shape_mn must contain two positive dimensions")
@@ -111,22 +104,6 @@ def make_token_comm_binding(
         raise ValueError("warp indices/counts must be non-negative")
     if not 1 <= flag_batch <= 32:
         raise ValueError("flag_batch must be in [1, 32]")
-    if token_back_standalone and not config.token_back_by_dispatch:
-        raise ValueError("standalone token-back requires token_back_by_dispatch")
-
-    if config.token_back_by_dispatch:
-        if fc2_n_tile is None or fc2_n_tile <= 0:
-            raise ValueError("token-back requires a positive fc2_n_tile")
-        # Each feature-cluster tile publishes once per CTA, including CTAs
-        # with no live rows in the last token-cluster tile.
-        publishes = (
-            ((config.hidden + fc2_n_tile - 1) // fc2_n_tile)
-            * cluster_shape_mn[0]
-            * cluster_shape_mn[1]
-        )
-    else:
-        publishes = 0
-
     return TokenCommBinding(
         world_size=config.world_size,
         num_topk=config.num_topk,
@@ -141,8 +118,4 @@ def make_token_comm_binding(
         dispatch_warp_start=dispatch_warp_start,
         num_other_warps=num_other_warps,
         flag_batch=flag_batch,
-        token_back_by_dispatch=config.token_back_by_dispatch,
-        fc2_publishes_per_token_cluster_tile=publishes,
-        token_back_standalone=token_back_standalone,
-        token_back_schedule_mode=config.token_back_schedule_mode,
     )

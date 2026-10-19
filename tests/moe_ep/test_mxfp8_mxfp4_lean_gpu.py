@@ -171,34 +171,13 @@ def test_lean_fc12_n64_multi_tile(counts, scale_alignment):
 
 
 @pytest.mark.arch_blackwell
-@pytest.mark.parametrize("tile_tokens", [64, 128])
-def test_lean_fc12_legacy_fc1_epilogue(monkeypatch, tile_tokens):
-    # Keep the diagnostic register-transpose path covered with gate8/up8 weights.
-    _require_blackwell()
-    from flashinfer.moe_ep.cute_dsl.megamoe.mxfp8_mxfp4.device_epilogue import (
-        FC1_EPI_LEGACY_ENV,
-    )
-
-    monkeypatch.setenv(FC1_EPI_LEGACY_ENV, "1")
-    launcher, inputs, rows, expected = _case((33, 65, 7, 129), 128)
-    launcher.tactic["mma_tiler_mnk"] = (128, tile_tokens, 128)
-    actual = launcher.run(inputs)
-    torch.cuda.synchronize()
-    torch.testing.assert_close(actual[rows], expected, atol=0.015, rtol=0.05)
-
-
-@pytest.mark.arch_blackwell
 @pytest.mark.parametrize("tile_tokens", [64, 128, 192])
 @pytest.mark.parametrize("warps", [4, 8])
 @pytest.mark.parametrize("fast_math,clamp", [(False, None), (True, 0.5)])
-def test_native_fc1_matches_transpose_bytes(
-    monkeypatch, tile_tokens, warps, fast_math, clamp
+def test_native_fc1_keeps_padding_and_is_deterministic(
+    tile_tokens, warps, fast_math, clamp
 ):
     _require_blackwell()
-    from flashinfer.moe_ep.cute_dsl.megamoe.mxfp8_mxfp4.device_epilogue import (
-        FC1_EPI_LEGACY_ENV,
-    )
-
     from flashinfer.moe_ep.cute_dsl.megamoe.mxfp8_mxfp4.weight_scale_views import (
         from_atom_swizzled,
     )
@@ -207,8 +186,7 @@ def test_native_fc1_matches_transpose_bytes(
     # and N64/N128/N192 tile boundaries with unequal data and scale row bases.
     counts = (0, 1, 31, 32, 33, 65, 129, 193)
     saved = []
-    for legacy in ("1", "0"):
-        monkeypatch.setenv(FC1_EPI_LEGACY_ENV, legacy)
+    for _ in range(2):
         launcher, inputs, rows, _ = _case(counts, 128, intermediate=640)
         launcher.tactic.update(
             mma_tiler_mnk=(128, tile_tokens, 128), epilogue_warps=warps
@@ -247,18 +225,14 @@ def test_native_fc1_matches_transpose_bytes(
 
 
 @pytest.mark.arch_blackwell
-def test_native_fc1_preserves_amax_zero_seed(monkeypatch):
+def test_native_fc1_preserves_amax_zero_seed():
     _require_blackwell()
-    from flashinfer.moe_ep.cute_dsl.megamoe.mxfp8_mxfp4.device_epilogue import (
-        FC1_EPI_LEGACY_ENV,
-    )
     from flashinfer.moe_ep.cute_dsl.megamoe.mxfp8_mxfp4.weight_scale_views import (
         from_atom_swizzled,
     )
 
     saved = []
-    for legacy in ("1", "0"):
-        monkeypatch.setenv(FC1_EPI_LEGACY_ENV, legacy)
+    for _ in range(2):
         launcher, inputs, rows, _ = _case((128,), 64)
         inputs.activation.view(torch.uint8).fill_(0x7F)  # E4M3 NaN
         launcher.run(inputs)
@@ -331,11 +305,9 @@ def test_lean_fc12_cuda_graph_replay(scale_alignment):
 @pytest.mark.arch_blackwell
 @pytest.mark.parametrize("tile_tokens", [64, 128, 192])
 @pytest.mark.parametrize("mma_m", [128, 256])
-@pytest.mark.parametrize("skip", ["none", "fc1", "both"])
-def test_lean_eight_warp_epilogue_is_bit_exact(monkeypatch, tile_tokens, mma_m, skip):
+def test_lean_eight_warp_epilogue_is_bit_exact(monkeypatch, tile_tokens, mma_m):
     """Both warpgroups must drain even when E1 gives one no token groups."""
     _require_blackwell()
-    monkeypatch.setenv("FLASHINFER_MXFP8_MXFP4_E1_SKIP", skip)
     baseline = None
     for warps in (4, 8):
         monkeypatch.setenv("FLASHINFER_MXFP8_MXFP4_EPILOGUE_WARPS", str(warps))
@@ -357,42 +329,3 @@ def test_lean_eight_warp_epilogue_is_bit_exact(monkeypatch, tile_tokens, mma_m, 
             graph.replay()
             torch.cuda.synchronize()
             assert torch.equal(output[rows], baseline)
-
-
-@pytest.mark.arch_blackwell
-@pytest.mark.parametrize("tile_tokens", [64, 128, 192])
-@pytest.mark.parametrize("warps", [4, 8])
-@pytest.mark.parametrize("mma_m", [128, 256])
-def test_fc1_tma_store_matches_direct_bytes(monkeypatch, tile_tokens, warps, mma_m):
-    """Exercise ring reuse, partial groups, row offsets and graph publication."""
-    _require_blackwell()
-    monkeypatch.delenv("FLASHINFER_MXFP8_MXFP4_FC1_EPI_LEGACY", raising=False)
-    saved = []
-    for enabled in ("0", "1"):
-        monkeypatch.setenv("FLASHINFER_MXFP8_MXFP4_FC1_TMA_STORE", enabled)
-        launcher, inputs, rows, expected = _case((0, 31, 32, 33, 191, 193, 257), 128)
-        launcher.tactic.update(
-            mma_tiler_mnk=(mma_m, tile_tokens, 128),
-            cluster_shape_mnk=(2 if mma_m == 256 else 1, 1, 1),
-            epilogue_warps=warps,
-        )
-        launcher.run(inputs)  # compile and allocate outside capture
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            launcher._fc1.view(torch.uint8).fill_(0x5A)
-            launcher._fc1_sf.view(torch.uint8).fill_(0x5A)
-            launcher.run(inputs)
-        for _ in range(5):
-            graph.replay()
-        torch.cuda.synchronize()
-        torch.testing.assert_close(inputs.output[rows], expected, atol=0.015, rtol=0.05)
-        saved.append(
-            (
-                inputs.output[rows].view(torch.uint8).clone(),
-                launcher._fc1.view(torch.uint8).clone(),
-                launcher._fc1_sf.view(torch.uint8).clone(),
-            )
-        )
-    # Includes all padding: a partial TMA box must not overwrite sentinel rows.
-    for direct, staged in zip(saved[0], saved[1], strict=True):
-        torch.testing.assert_close(direct, staged, rtol=0, atol=0)

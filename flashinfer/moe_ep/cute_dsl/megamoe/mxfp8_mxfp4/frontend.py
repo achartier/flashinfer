@@ -27,8 +27,11 @@ class FrontendConfig:
     num_experts: int
     max_tokens: int
     tactic: Hashable
+    output_mode: str = "combined"
 
     def __post_init__(self) -> None:
+        if self.output_mode not in ("combined", "per_route"):
+            raise ValueError("output_mode must be combined or per_route")
         for name in ("hidden", "intermediate"):
             value = getattr(self, name)
             if value <= 0 or value % 32:
@@ -234,13 +237,18 @@ def validate_launch_spec(config: FrontendConfig, spec: KernelLaunchSpec) -> None
         or spec.route_scores.shape != spec.route_ids.shape
     ):
         raise ValueError("route_scores must be float32 [max_tokens, topk]")
+    output_tail = (
+        (config.hidden,)
+        if config.output_mode == "combined"
+        else (config.topk, config.hidden)
+    )
     if (
-        spec.output.ndim != 2
+        spec.output.ndim != len(output_tail) + 1
         or spec.output.dtype != torch.bfloat16
         or spec.output.shape[0] < spec.num_tokens
-        or spec.output.shape[1] != config.hidden
+        or tuple(spec.output.shape[1:]) != output_tail
     ):
-        raise ValueError("output must be BF16 [>= num_tokens, hidden]")
+        raise ValueError(f"output must be BF16 [>= num_tokens, {output_tail}]")
 
 
 def _ensure_not_capturing(what: str) -> None:

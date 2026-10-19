@@ -1,8 +1,13 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Host tests for the MXFP8 x MXFP4 persistent scheduler contract."""
 
+from dataclasses import replace
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 import sys
+from typing import TYPE_CHECKING
 
 import pytest
 
@@ -21,13 +26,16 @@ AtomicTileClaimer = _SCHEDULER.AtomicTileClaimer
 PEEK_READY_BIT = _SCHEDULER.PEEK_READY_BIT
 PersistentFc1Fc2Scheduler = _SCHEDULER.PersistentFc1Fc2Scheduler
 Phase = _SCHEDULER.Phase
-SchedulerConfig = _SCHEDULER.SchedulerConfig
+if TYPE_CHECKING:
+    from .scheduler import SchedulerConfig
+else:
+    SchedulerConfig = _SCHEDULER.SchedulerConfig
 StaticTileClaimer = _SCHEDULER.StaticTileClaimer
 WorkRecord = _SCHEDULER.WorkRecord
 
 
-def _config(**overrides):
-    values = dict(
+def _config(**overrides) -> SchedulerConfig:
+    config = SchedulerConfig(
         expert_token_counts=(17, 0, 33),
         gate_up_size=256,
         hidden_size=128,
@@ -40,8 +48,7 @@ def _config(**overrides):
         num_persistent_clusters=3,
         fc2_ready_threshold=2,
     )
-    values.update(overrides)
-    return SchedulerConfig(**values)
+    return replace(config, **overrides)
 
 
 def test_work_record_wire_order_and_packed_phase() -> None:
@@ -91,8 +98,9 @@ def test_cta_decode_clips_tail_tokens_and_expands_feature_axis() -> None:
     assert tail.valid_tokens_in_cta_tile == 1
 
 
-def test_static_claimers_partition_work_without_overlap() -> None:
-    scheduler = PersistentFc1Fc2Scheduler(_config())
+@pytest.mark.parametrize("clusters", [3, 64])
+def test_static_claimers_partition_work_without_overlap(clusters: int) -> None:
+    scheduler = PersistentFc1Fc2Scheduler(_config(num_persistent_clusters=clusters))
     claimed: list[int] = []
     for cluster_id in range(scheduler.config.num_persistent_clusters):
         claimer = StaticTileClaimer(

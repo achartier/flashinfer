@@ -139,11 +139,14 @@ def _layout_adapter(cls, *, hidden: int, intermediate: int, experts: int):
 class _MegaAdapterBindings:
     """Frontend adapter for one native persistent kernel plus reducer."""
 
-    def __init__(self, *, workspace, tactic, gate_up_clamp, fast_math) -> None:
+    def __init__(
+        self, *, workspace, tactic, gate_up_clamp, fast_math, output_mode="combined"
+    ) -> None:
         self.workspace = workspace
         self.tactic = dict(tactic)
         self.gate_up_clamp = gate_up_clamp
         self.fast_math = bool(fast_math)
+        self.output_mode = output_mode
 
     @staticmethod
     def assembly_protocol() -> DeviceAssemblyProtocol:
@@ -262,9 +265,6 @@ class _MegaAdapterBindings:
             stream=cuda.CUstream(spec.stream),
             expert_data_row_offsets=None,
             expert_scale_row_offsets=None,
-            fc2_output_workspace=v.get("fc2_output_workspace"),
-            fc2_done_counter=v.get("fc2_done_counter"),
-            token_back_schedule_counter=v.get("token_back_schedule_counter"),
         )
 
 
@@ -276,10 +276,11 @@ class PersistentFc12KernelBase:
     workspace: Any
     gate_up_clamp: float | None
     fast_math: bool
+    output_mode: str = "combined"
 
     mega = False
     resolved_num_stages = None
-    startup_prefetch_plan = None
+    resolved_persistent_clusters = None
 
     def _fit_operand_stages(
         self,
@@ -288,7 +289,6 @@ class PersistentFc12KernelBase:
         wc,
         local_rank,
         warps,
-        fc2_store_mode,
         cluster_shape_mn,
         load_balance_mode,
         flag_batch,
@@ -315,6 +315,7 @@ class PersistentFc12KernelBase:
                 dispatch_warp_start=warps.dispatch[0],
                 num_other_warps=len(warps.epilogue) + 4,
                 flag_batch=flag_batch,
+                cta_local_counts=self.tactic.get("cta_local_counts", False),
             )
         fit = fit_operand_stages(
             mma_tiler_mnk=tuple(self.tactic["mma_tiler_mnk"]),
@@ -324,7 +325,6 @@ class PersistentFc12KernelBase:
             ),
             dispatch_phase=dispatch,
             epilogue_warps=len(warps.epilogue),
-            fc2_store_mode=fc2_store_mode,
             smem_capacity_bytes=cutlass.utils.get_smem_capacity_in_bytes(),
             # 2-CTA stages are smaller per CTA; allow the deeper pipelines
             # they fit (the 1-CTA cap stays at the measured default).
@@ -354,7 +354,6 @@ class PersistentFc12KernelBase:
         )
         from .device_scheduler import DeviceSchedulerParams
         from .dispatch import Mxfp8DispatchPhase
-        from .fc1_store import fc1_tma_store_enabled, fc1_store_layout
         from .fc2_epilogue import Fc2RouteStore
         from .kernel_driver import (
             DriverViews,
@@ -376,19 +375,23 @@ class PersistentFc12KernelBase:
             blockscaled_utils=blockscaled_utils,
         )
 
+        requested_clusters = self.tactic.get("persistent_clusters")
+        clusters = (
+            max_active_clusters
+            if requested_clusters is None
+            else min(requested_clusters, max_active_clusters)
+        )
+        if clusters < 1:
+            raise ValueError("at least one persistent cluster is required")
+        self.resolved_persistent_clusters = clusters
         m, n, _ = self.tactic["mma_tiler_mnk"]
         cm, cn, _ = self.tactic["cluster_shape_mnk"]
-        use_fc1_tma_store = fc1_tma_store_enabled()
-        from ....backends.mega.kernel.sm100.mxfp8_mxfp4_bf16_cutedsl.config import (
-            default_fc2_store_mode,
-        )
-
-        fc2_store_mode = self.tactic.get("fc2_store_mode") or default_fc2_store_mode()
         mega = self.mega
-        vector_count_publish = self.tactic.get("vector_count_publish", False)
         cta_local_counts = self.tactic.get("cta_local_counts", False)
-        overlap_dispatch_pull = self.tactic.get("overlap_dispatch_pull", False)
-        in_kernel_reduce = mega and self.tactic.get("in_kernel_reduce", False)
+        per_route = mega and self.output_mode == "per_route"
+        in_kernel_reduce = (
+            mega and not per_route and self.tactic.get("in_kernel_reduce", False)
+        )
         # The tactic selects the epilogue width (Mega always resolves one);
         # the lean proxy's fixed tactic has none and follows the environment.
         epilogue_warps = self.tactic.get("epilogue_warps") or epilogue_warps_from_env()
@@ -424,35 +427,8 @@ class PersistentFc12KernelBase:
             else wc.pool_sf_capacity
         )
         cluster_size = cm * cn
-        startup_waves = 0
-        if mega and self.tactic.get("startup_prefetch_waves", 0):
-            from .startup_prefetch import plan_startup_prefetch
-
-            requested_waves = self.tactic.get("startup_prefetch_waves", 0)
-            l2_bytes = torch.cuda.get_device_properties(
-                self.workspace.workspace_bytes.device
-            ).L2_cache_size
-            self.startup_prefetch_plan = plan_startup_prefetch(
-                requested_waves,
-                hidden=config.hidden,
-                intermediate=config.intermediate,
-                experts=config.num_experts,
-                mma_m=m,
-                clusters=max_active_clusters,
-                l2_bytes=l2_bytes,
-            )
-            startup_waves = self.startup_prefetch_plan.waves
-            _logger.info(
-                "MXFP8 x MXFP4 startup prefetch: requested=%d resolved=%d "
-                "bytes_per_wave=%d budget=%d L2=%d",
-                requested_waves,
-                startup_waves,
-                self.startup_prefetch_plan.bytes_per_wave,
-                self.startup_prefetch_plan.budget_bytes,
-                l2_bytes,
-            )
-        active_sms = max_active_clusters * cluster_size
-        group_hint = self.tactic.get("group_hint") or max_active_clusters
+        active_sms = clusters * cluster_size
+        group_hint = self.tactic.get("group_hint") or clusters
         # Per-CTA feature tile: a 2-CTA (M256) MMA spans two CTAs of 128 rows.
         cta_m = m // 2 if m == 256 else m
         if m == 256 and (config.hidden % 256 or (2 * config.intermediate) % 256):
@@ -466,7 +442,6 @@ class PersistentFc12KernelBase:
         if not self.mega and load_balance_mode != "static":
             raise ValueError("lean FC12 requires static load balancing")
         flag_batch = self.tactic["flag_batch"]
-        token_back_by_dispatch = mega and wc.token_back_by_dispatch
         num_stages = self.tactic["num_stages"]
         if num_stages == "auto":
             num_stages = self._fit_operand_stages(
@@ -474,12 +449,16 @@ class PersistentFc12KernelBase:
                 wc=wc,
                 local_rank=local_rank,
                 warps=warps,
-                fc2_store_mode=fc2_store_mode,
                 cluster_shape_mn=(cm, cn),
                 load_balance_mode=load_balance_mode,
                 flag_batch=flag_batch,
             )
         self.resolved_num_stages = num_stages
+        _logger.info(
+            "MXFP8 x MXFP4 mega: persistent_clusters=%d, num_stages=%d",
+            clusters,
+            num_stages,
+        )
         gate_up_clamp = self.gate_up_clamp
         fast_math = self.fast_math
 
@@ -503,8 +482,6 @@ class PersistentFc12KernelBase:
             p2sbt,
             dispatch_args,
             scheduler_params,
-            fc1_store_atom,
-            fc1_store_tensor,
             fc1_output,
             fc1_output_sf,
             fc1_done_counter,
@@ -528,16 +505,13 @@ class PersistentFc12KernelBase:
                     dispatch_warp_start=warps.dispatch[0],
                     num_other_warps=len(warps.epilogue) + 4,
                     flag_batch=flag_batch,
-                    vector_count_publish=vector_count_publish,
                     cta_local_counts=cta_local_counts,
-                    overlap_dispatch_pull=overlap_dispatch_pull,
                 )
             epilogue = PersistentMxfp8Mxfp4Epilogue(
                 DeviceEpilogueConfig(
                     cta_tile_features=cta_m,
                     cta_tile_tokens=n,
                     epilogue_warps=len(warps.epilogue),
-                    fc2_store_mode=fc2_store_mode,
                     gate_up_clamp=gate_up_clamp,
                     fast_math=fast_math,
                 )
@@ -597,21 +571,11 @@ class PersistentFc12KernelBase:
                     ),
                 ),
             )
-            fc1_store = None
-            if cutlass.const_expr(use_fc1_tma_store):
-                store_smem = pipes.allocate_fc1_store_smem(smem)
-                fc1_store = (fc1_store_atom, fc1_store_tensor, store_smem)
             operands = pipes.allocate_operand_smem(smem)
             if cutlass.const_expr(in_kernel_reduce):
-                # All operand TMA/UMMA users drain before the tail rendezvous.
-                # Alias their contiguous allocation; do not grow shared memory
-                # or reduce the mainloop's automatically fitted stage count.
-                dispatch.bind_in_kernel_reduce(
-                    route_terms,
-                    reduce_output,
-                    scratch=operands.weight.iterator,
-                    scratch_bytes=num_stages * staging.operand_stage_bytes().total,
-                )
+                dispatch.bind_in_kernel_reduce(route_terms, reduce_output)
+            if cutlass.const_expr(per_route):
+                dispatch.bind_per_route_output(route_terms)
             mainloop = pipes.create_mainloop_pipelines(storage)
             sched = pipes.create_scheduler(
                 storage, block_idx=cute.arch.block_idx(), grid_dim=cute.arch.grid_dim()
@@ -661,23 +625,9 @@ class PersistentFc12KernelBase:
                 route_terms,
                 dispatch_args.peer_rank_ptr_mapper if mega else None,
             )
-            if cutlass.const_expr(token_back_by_dispatch):
-                # Stage unweighted BF16 rows in expert-pool order. Dispatch
-                # warps resolve source metadata only when pushing the rows.
-                fc2_store = Fc2RouteStore(
-                    cute.make_tensor(
-                        dispatch_args.fc2_output_workspace.iterator,
-                        cute.make_layout(
-                            (pool_tokens, 1, config.hidden),
-                            stride=(config.hidden, 0, 1),
-                        ),
-                    )
-                )
             PersistentM128DeviceDriver(
                 kernel_pipelines=pipes,
                 stats_word_offset=stats_word_offset,
-                startup_prefetch_waves=startup_waves,
-                startup_prefetch_clusters=max_active_clusters,
             )(
                 mainloop_pipelines=mainloop,
                 scheduler_bundle=sched,
@@ -691,21 +641,11 @@ class PersistentFc12KernelBase:
                     fc1_output_scales=fc1_output_sf_logical,
                     route_store=fc2_store,
                     fc1_done_counter=fc1_done_counter,
-                    token_metadata=(
-                        dispatch_args.token_src_metadata
-                        if mega and not token_back_by_dispatch
-                        else None
-                    ),
-                    fc2_done_counter=(
-                        dispatch_args.fc2_done_counter
-                        if token_back_by_dispatch
-                        else None
-                    ),
+                    token_metadata=dispatch_args.token_src_metadata if mega else None,
                 ),
                 dispatch_args=dispatch_args,
                 dispatch_storage=storage.dispatch if mega else None,
                 epilogue_exchange=epilogue_exchange,
-                fc1_store=fc1_store,
                 fc1_k_tiles=(config.hidden + staging.mma_tiler[2] - 1)
                 // staging.mma_tiler[2],
                 fc2_k_tiles=(config.intermediate + staging.mma_tiler[2] - 1)
@@ -748,9 +688,6 @@ class PersistentFc12KernelBase:
                 stream,
                 expert_data_row_offsets,
                 expert_scale_row_offsets,
-                fc2_output_workspace,
-                fc2_done_counter,
-                token_back_schedule_counter,
             ):
                 # Descriptor construction belongs to this enclosing JIT trace.
                 staging = Mxfp8Mxfp4TmaStaging(
@@ -782,9 +719,6 @@ class PersistentFc12KernelBase:
                         shared_zero_prefix,
                         peer_rank_ptr_mapper_host,
                         route_terms,
-                        fc2_output_workspace,
-                        fc2_done_counter,
-                        token_back_schedule_counter,
                     )
                     counts_i32 = cute.recast_tensor(
                         expert_recv_count_sum, cutlass.Int32
@@ -860,14 +794,6 @@ class PersistentFc12KernelBase:
                     ws.fc2_weight_sfa_logical,
                     xs2,
                 )
-                store_atom, store_tensor = None, None
-                if cutlass.const_expr(use_fc1_tma_store):
-                    store_atom, store_tensor = cpasync.make_tiled_tma_atom(
-                        cpasync.CopyBulkTensorTileS2GOp(),
-                        fc1_output,
-                        cute.slice_(fc1_store_layout(), (None, None, 0, 0)),
-                        (32, 64),
-                    )
                 kernel(
                     phase1[0],
                     phase1[1],
@@ -887,15 +813,13 @@ class PersistentFc12KernelBase:
                     phase2[7],
                     args,
                     params,
-                    store_atom,
-                    store_tensor,
                     fc1_output,
                     fc1_output_sf,
                     fc1_done_counter,
                     route_terms,
                     output if in_kernel_reduce else None,
                 ).launch(
-                    grid=(cm, cn, max_active_clusters),
+                    grid=(cm, cn, clusters),
                     block=(warps.threads_per_cta, 1, 1),
                     cluster=(cm, cn, 1),
                     stream=stream,
@@ -925,9 +849,6 @@ class PersistentFc12KernelBase:
                 shared_zero_prefix,
                 peer_rank_ptr_mapper_host,
                 route_terms,
-                fc2_output_workspace,
-                fc2_done_counter,
-                token_back_schedule_counter,
             ):
                 dispatch = Mxfp8DispatchPhase(
                     wc,
@@ -954,13 +875,6 @@ class PersistentFc12KernelBase:
                     token_src_metadata=token_src_metadata,
                     # The helper offsets combine_output in bytes.
                     combine_output=cute.recast_tensor(route_terms, cutlass.Uint8),
-                    fc2_output_workspace=fc2_output_workspace,
-                    fc2_done_counter=fc2_done_counter,
-                    token_back_schedule_counter=(
-                        token_back_schedule_counter.iterator
-                        if token_back_schedule_counter is not None
-                        else None
-                    ),
                     nvlink_barrier_signal=nvlink_barrier_signal,
                     nvlink_barrier_counter=nvlink_barrier_counter,
                     grid_sync_counter=grid_sync_counter,
@@ -1010,7 +924,9 @@ class PersistentMxfp8Mxfp4KernelAdapter(_MegaAdapterBindings, PersistentFc12Kern
             stream=runtime["stream"],
         )
         reducer = None
-        if not self.tactic.get("in_kernel_reduce", False):
+        if self.output_mode == "combined" and not self.tactic.get(
+            "in_kernel_reduce", False
+        ):
             reducer = cute.compile(
                 DeterministicTopKReducer(hidden=config.hidden, num_topk=config.topk),
                 **reducer_runtime,

@@ -161,6 +161,28 @@ def _cvt_f32x2_to_e4m3x2_rn_satfinite(x0, x1, *, loc=None, ip=None):
 
 
 @cute.jit
+def silu(g0: cutlass.Float32, g1: cutlass.Float32, fast_math: bool):
+    """FP32 SiLU of a packed pair; replace this helper to change activation.
+
+    Clamping, multiplication by the up projection, and MXFP8 quantization
+    belong to the caller. Preserve the separate rounded gate * sigmoid
+    product here to retain the default numerical contract.
+    """
+
+    exp0 = cute.math.exp(-g0, fastmath=fast_math)
+    exp1 = cute.math.exp(-g1, fastmath=fast_math)
+    sigmoid0 = cute.math.rcp(
+        cutlass.Float32(1.0) + exp0, approx=fast_math, ftz=fast_math
+    )
+    sigmoid1 = cute.math.rcp(
+        cutlass.Float32(1.0) + exp1, approx=fast_math, ftz=fast_math
+    )
+    return cute.arch.mul_packed_f32x2(
+        (g0, g1), (sigmoid0, sigmoid1), rnd="rn", ftz=False
+    )
+
+
+@cute.jit
 def _clamp_and_swiglu(
     output: cute.Tensor,
     gate: cute.Tensor,
@@ -184,23 +206,8 @@ def _clamp_and_swiglu(
             u0 = cute.arch.fmax(cute.arch.fmin(u0, limit), -limit)
             u1 = cute.arch.fmax(cute.arch.fmin(u1, limit), -limit)
 
-        exp0 = cute.math.exp(-g0, fastmath=fast_math)
-        exp1 = cute.math.exp(-g1, fastmath=fast_math)
-        sigmoid0 = cute.math.rcp(
-            cutlass.Float32(1.0) + exp0,
-            approx=fast_math,
-            ftz=fast_math,
-        )
-        sigmoid1 = cute.math.rcp(
-            cutlass.Float32(1.0) + exp1,
-            approx=fast_math,
-            ftz=fast_math,
-        )
-
         # Keep this association synchronized with CONTRACT.md and reference.py.
-        silu0, silu1 = cute.arch.mul_packed_f32x2(
-            (g0, g1), (sigmoid0, sigmoid1), rnd="rn", ftz=False
-        )
+        silu0, silu1 = silu(g0, g1, fast_math)
         output[idx], output[idx + 1] = cute.arch.mul_packed_f32x2(
             (u0, u1), (silu0, silu1), rnd="rn", ftz=False
         )
@@ -417,5 +424,6 @@ __all__ = [
     "Fc1EpilogueConfig",
     "SF_VEC_SIZE",
     "handoff_storage_bytes",
+    "silu",
     "validate_fc1_epilogue_contract",
 ]

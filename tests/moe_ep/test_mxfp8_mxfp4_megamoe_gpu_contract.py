@@ -152,6 +152,7 @@ def _full_kernel_case(
     knobs=None,
     capacity_tactics=None,
     check_reference=True,
+    output_mode="combined",
 ):
     from flashinfer.moe_ep.cute_dsl.megamoe.mxfp8_mxfp4.integration import (
         get_symm_buffer_for_mxfp8_mxfp4_mega_moe,
@@ -174,7 +175,7 @@ def _full_kernel_case(
 
     def quantize_weights(weights):
         # The exhaustive FP4 oracle materializes 16 distances per value.
-        # Bound its temporary memory for customer-sized multi-expert weights.
+        # Bound its temporary memory for large multi-expert weights.
         if weights.numel() > 256 * 1024 * 1024:
             quantized = [quantize_mxfp4(expert) for expert in weights]
             return tuple(torch.stack(parts) for parts in zip(*quantized, strict=True))
@@ -194,7 +195,7 @@ def _full_kernel_case(
     scores = random((tokens, topk), 0.3)
     expected = None
     if check_reference:
-        expected = compute_reference(
+        reference = compute_reference(
             input_q=xq.unsqueeze(0),
             input_scale=xs.unsqueeze(0),
             topk_ids=ids.unsqueeze(0),
@@ -203,7 +204,10 @@ def _full_kernel_case(
             w13_scale=w13s,
             w2_packed=w2q,
             w2_scale=w2s,
-        ).output[0]
+        )
+        expected = (
+            reference.output if output_mode == "combined" else reference.route_terms
+        )[0]
     workspace = get_symm_buffer_for_mxfp8_mxfp4_mega_moe(
         experts,
         max(tokens, 1),
@@ -214,6 +218,7 @@ def _full_kernel_case(
         1,
         knobs=knobs,
         capacity_tactics=capacity_tactics,
+        output_mode=output_mode,
     )
     workspace.x[:tokens].copy_(xq)
     workspace.x_sf[:tokens].view(torch.uint8).copy_(xs)
@@ -222,63 +227,31 @@ def _full_kernel_case(
     w13 = (w13q.transpose(1, 2), torch.stack([to_atom_swizzled(s) for s in w13s]))
     w2 = (w2q.transpose(1, 2), torch.stack([to_atom_swizzled(s) for s in w2s]))
 
-    def launch():
-        return mxfp8_mxfp4_mega_moe(None, w13, w2, workspace, num_tokens=tokens)
+    def launch(output=None):
+        return mxfp8_mxfp4_mega_moe(output, w13, w2, workspace, num_tokens=tokens)
 
     return workspace, launch, expected
 
 
 @pytest.mark.arch_blackwell
-@pytest.mark.parametrize("hidden,intermediate", [(4096, 6400), (6400, 4736)])
-@pytest.mark.parametrize("token_back_mode", ["epi_warps", "reuse_dispatch_warps"])
-def test_fc2_staged_model_width_bitwise(hidden, intermediate, token_back_mode):
-    """Compare every output at model width; the independent oracle is gated
-    separately by the boundary suite and reference-checked benchmark.
-    """
-    _require_b200()
-    knobs = dict(
-        mma_tiler_mnk=(256, 128, 128),
-        epilogue_warps=8,
-        token_back_mode=token_back_mode,
-        fc2_store_mode="direct",
-    )
-    workspace, launch, _ = _full_kernel_case(
-        200, hidden, intermediate, 2, 2, knobs=knobs, check_reference=False
-    )
-    try:
-        direct = launch().clone()
-        for mode in ("staged64", "staged256"):
-            workspace.apply_knobs(dict(knobs, fc2_store_mode=mode))
-            torch.testing.assert_close(launch(), direct, rtol=0, atol=0)
-    finally:
-        workspace.destroy()
-
-
-@pytest.mark.arch_blackwell
 @pytest.mark.parametrize("epilogue_warps", [4, 8])
-@pytest.mark.parametrize("token_back_mode", ["epi_warps", "reuse_dispatch_warps"])
 @pytest.mark.parametrize("tile_tokens", [64, 128, 192])
-def test_fc2_staged_stores_bitwise(epilogue_warps, token_back_mode, tile_tokens):
+def test_fc2_staged_stores_bitwise(epilogue_warps, tile_tokens):
     _require_b200()
     knobs = dict(
         mma_tiler_mnk=(256, tile_tokens, 128),
         epilogue_warps=epilogue_warps,
-        token_back_mode=token_back_mode,
-        fc2_store_mode="direct",
     )
     workspace, launch, expected = _full_kernel_case(200, 256, 256, 4, 2, knobs=knobs)
     try:
-        direct = launch().clone()
-        torch.testing.assert_close(direct, expected, rtol=0.05, atol=0.015)
-        for mode in ("staged64", "staged256", "direct"):
-            workspace.apply_knobs(dict(knobs, fc2_store_mode=mode))
-            torch.testing.assert_close(launch(), direct, rtol=0, atol=0)
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
-                result = launch()
-            for _ in range(3):
-                graph.replay()
-                torch.testing.assert_close(result, direct, rtol=0, atol=0)
+        baseline = launch().clone()
+        torch.testing.assert_close(baseline, expected, rtol=0.05, atol=0.015)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            result = launch()
+        for _ in range(3):
+            graph.replay()
+            torch.testing.assert_close(result, baseline, rtol=0, atol=0)
     finally:
         workspace.destroy()
 
@@ -286,14 +259,6 @@ def test_fc2_staged_stores_bitwise(epilogue_warps, token_back_mode, tile_tokens)
 @pytest.mark.arch_blackwell
 @pytest.mark.parametrize(
     "load_balance_mode", ["static", "atomic_counter", "alternating"]
-)
-@pytest.mark.parametrize(
-    "token_back_mode,token_back_schedule_mode",
-    [
-        ("epi_warps", "static"),
-        ("reuse_dispatch_warps", "static"),
-        ("reuse_dispatch_warps", "atomic_counter"),
-    ],
 )
 @pytest.mark.parametrize(
     "shape",
@@ -305,21 +270,16 @@ def test_fc2_staged_stores_bitwise(epilogue_warps, token_back_mode, tile_tokens)
     ],
 )
 def test_mxfp8_mxfp4_megamoe_full_kernel_boundary_shapes(
-    shape, load_balance_mode, token_back_mode, token_back_schedule_mode
+    shape, load_balance_mode
 ) -> None:
     _require_b200()
     workspace, launch, expected = _full_kernel_case(
         *shape,
         knobs={
             "load_balance_mode": load_balance_mode,
-            "token_back_mode": token_back_mode,
-            "token_back_schedule_mode": token_back_schedule_mode,
         },
     )
     try:
-        assert workspace.plan.config.token_back_by_dispatch == (
-            token_back_mode == "reuse_dispatch_warps"
-        )
         for _ in range(3):
             actual = launch()
             torch.cuda.synchronize()
@@ -331,14 +291,6 @@ def test_mxfp8_mxfp4_megamoe_full_kernel_boundary_shapes(
 @pytest.mark.arch_blackwell
 @pytest.mark.parametrize(
     "load_balance_mode", ["static", "atomic_counter", "alternating"]
-)
-@pytest.mark.parametrize(
-    "token_back_mode,token_back_schedule_mode",
-    [
-        ("epi_warps", "static"),
-        ("reuse_dispatch_warps", "static"),
-        ("reuse_dispatch_warps", "atomic_counter"),
-    ],
 )
 @pytest.mark.parametrize(
     "tokens,tile_tokens,cluster_shape",
@@ -354,8 +306,6 @@ def test_mxfp8_mxfp4_megamoe_full_kernel_cuda_graph_replay(
     tokens,
     tile_tokens,
     cluster_shape,
-    token_back_mode,
-    token_back_schedule_mode,
 ) -> None:
     _require_b200()
     workspace, launch, expected = _full_kernel_case(
@@ -366,8 +316,6 @@ def test_mxfp8_mxfp4_megamoe_full_kernel_cuda_graph_replay(
         2,
         knobs={
             "load_balance_mode": load_balance_mode,
-            "token_back_mode": token_back_mode,
-            "token_back_schedule_mode": token_back_schedule_mode,
             "mma_tiler_mnk": (128, tile_tokens, 128),
             "cluster_shape_mnk": cluster_shape,
             "group_hint": 1,
@@ -394,60 +342,9 @@ def test_mxfp8_mxfp4_megamoe_full_kernel_cuda_graph_replay(
 
 
 @pytest.mark.arch_blackwell
-def test_mxfp8_mxfp4_token_back_modes_are_bit_exact() -> None:
-    _require_b200()
-    baseline = None
-    for mode, schedule in (
-        ("epi_warps", "static"),
-        ("reuse_dispatch_warps", "static"),
-        ("reuse_dispatch_warps", "atomic_counter"),
-    ):
-        workspace, launch, expected = _full_kernel_case(
-            129,
-            384,
-            256,
-            4,
-            2,
-            knobs={
-                "token_back_mode": mode,
-                "token_back_schedule_mode": schedule,
-                "load_balance_mode": "atomic_counter",
-                "group_hint": 1,
-            },
-        )
-        try:
-            actual = launch().clone()
-            torch.cuda.synchronize()
-            torch.testing.assert_close(actual, expected, atol=0.015, rtol=0.05)
-            if baseline is None:
-                baseline = actual
-            else:
-                torch.testing.assert_close(actual, baseline, atol=0, rtol=0)
-            # Empty and restore routes without resetting the workspace. Stale
-            # pool rows must never leak into the deterministic home reduction.
-            ids = workspace.topk_idx.clone()
-            workspace.topk_idx.fill_(-1)
-            torch.testing.assert_close(
-                launch(), torch.zeros_like(actual), atol=0, rtol=0
-            )
-            workspace.topk_idx.copy_(ids)
-            torch.testing.assert_close(launch(), actual, atol=0, rtol=0)
-        finally:
-            workspace.destroy()
-
-
-@pytest.mark.arch_blackwell
 @pytest.mark.parametrize("epilogue_warps", [4, 8])
 @pytest.mark.parametrize(
     "load_balance_mode", ["static", "atomic_counter", "alternating"]
-)
-@pytest.mark.parametrize(
-    "token_back_mode,token_back_schedule_mode",
-    [
-        ("epi_warps", "static"),
-        ("reuse_dispatch_warps", "static"),
-        ("reuse_dispatch_warps", "atomic_counter"),
-    ],
 )
 @pytest.mark.parametrize(
     "tokens,hidden,mma_m,tile_tokens",
@@ -461,18 +358,14 @@ def test_mxfp8_mxfp4_token_back_modes_are_bit_exact() -> None:
     ],
 )
 def test_megamoe_in_kernel_reduce_is_bit_exact(
-    monkeypatch,
     tokens,
     hidden,
     mma_m,
     tile_tokens,
     epilogue_warps,
     load_balance_mode,
-    token_back_mode,
-    token_back_schedule_mode,
 ) -> None:
     _require_b200()
-    monkeypatch.setenv("FLASHINFER_MXFP8_MXFP4_PIPELINED_COMBINE", "1")
     baseline = None
     for in_kernel_reduce in (False, True):
         workspace, launch, expected = _full_kernel_case(
@@ -485,12 +378,10 @@ def test_megamoe_in_kernel_reduce_is_bit_exact(
                 "in_kernel_reduce": in_kernel_reduce,
                 "epilogue_warps": epilogue_warps,
                 "load_balance_mode": load_balance_mode,
-                "token_back_mode": token_back_mode,
-                "token_back_schedule_mode": token_back_schedule_mode,
                 "mma_tiler_mnk": (mma_m, tile_tokens, 128),
                 "group_hint": 1,
-                # Exercise combine aliasing with a small operand ring as well
-                # as the automatically fitted rings of the smaller cases.
+                # A small pinned operand ring as well as the automatically
+                # fitted rings of the smaller cases.
                 **({"num_stages": 2} if hidden >= 4096 else {}),
             },
         )
@@ -529,11 +420,8 @@ def test_megamoe_in_kernel_reduce_is_bit_exact(
 @pytest.mark.arch_blackwell
 @pytest.mark.parametrize("topk", [1, 8, 32])
 @pytest.mark.parametrize("epilogue_warps", [4, 8])
-def test_megamoe_in_kernel_reduce_topk_limits(
-    monkeypatch, topk, epilogue_warps
-) -> None:
+def test_megamoe_in_kernel_reduce_topk_limits(topk, epilogue_warps) -> None:
     _require_b200()
-    monkeypatch.setenv("FLASHINFER_MXFP8_MXFP4_PIPELINED_COMBINE", "1")
     baseline = None
     for enabled in (False, True):
         workspace, launch, expected = _full_kernel_case(
@@ -545,8 +433,6 @@ def test_megamoe_in_kernel_reduce_topk_limits(
             knobs={
                 "in_kernel_reduce": enabled,
                 "epilogue_warps": epilogue_warps,
-                "token_back_mode": "reuse_dispatch_warps",
-                "token_back_schedule_mode": "atomic_counter",
             },
         )
         try:
@@ -563,9 +449,8 @@ def test_megamoe_in_kernel_reduce_topk_limits(
 @pytest.mark.arch_blackwell
 @pytest.mark.parametrize("tile_tokens", [64, 128, 192])
 @pytest.mark.parametrize("mma_m", [128, 256])
-@pytest.mark.parametrize("token_back_mode", ["epi_warps", "reuse_dispatch_warps"])
 def test_megamoe_eight_warp_epilogue_is_bit_exact(
-    monkeypatch, tile_tokens, mma_m, token_back_mode
+    monkeypatch, tile_tokens, mma_m
 ) -> None:
     _require_b200()
     baseline = None
@@ -580,7 +465,6 @@ def test_megamoe_eight_warp_epilogue_is_bit_exact(
             knobs={
                 "mma_tiler_mnk": (mma_m, tile_tokens, 128),
                 "cluster_shape_mnk": (2 if mma_m == 256 else 1, 1, 1),
-                "token_back_mode": token_back_mode,
                 "load_balance_mode": "atomic_counter",
                 "group_hint": 1,
             },
@@ -818,139 +702,17 @@ def test_megamoe_apply_knobs_switches_tactics_bit_exact(load_balance_mode) -> No
             workspace.apply_knobs(tactics[index])
             actual = launch()
             assert torch.equal(actual.view(torch.uint8), fresh[index].view(torch.uint8))
-        # A tactic whose plan exceeds the allocation is rejected, not clipped.
-        too_big = {**tactics[0], "token_back_mode": "reuse_dispatch_warps"}
-        assert not workspace.fits(too_big)
+    finally:
+        workspace.destroy()
+    # A tactic whose plan exceeds the allocation is rejected, not clipped: N64
+    # needs more task-tile counters than an N128-only workspace holds.
+    workspace, _, _ = _full_kernel_case(
+        *shape, knobs=tactics[1], capacity_tactics=[tactics[1]]
+    )
+    try:
+        assert not workspace.fits(tactics[0])
         with pytest.raises(ValueError, match="capacity_tactics"):
-            workspace.apply_knobs(too_big)
-    finally:
-        workspace.destroy()
-
-
-@pytest.mark.arch_blackwell
-@pytest.mark.parametrize("epilogue_warps", [4, 8])
-@pytest.mark.parametrize("token_back_mode", ["epi_warps", "reuse_dispatch_warps"])
-@pytest.mark.parametrize("topk,experts", [(1, 8), (3, 64), (8, 8), (32, 32)])
-def test_dispatch_dedup_is_bit_exact(epilogue_warps, token_back_mode, topk, experts):
-    _require_b200()
-    baseline = None
-    for enabled in (False, True):
-        workspace, launch, expected = _full_kernel_case(
-            33,
-            256,
-            256,
-            experts,
-            topk,
-            knobs={
-                "dispatch_dedup": enabled,
-                "epilogue_warps": epilogue_warps,
-                "token_back_mode": token_back_mode,
-                "flag_batch": 4,
-            },
-        )
-        try:
-            actual = launch().clone()
-            torch.cuda.synchronize()
-            torch.testing.assert_close(actual, expected, atol=0.015, rtol=0.05)
-            if baseline is None:
-                baseline = actual
-            assert torch.equal(actual.view(torch.uint8), baseline.view(torch.uint8))
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
-                captured = launch()
-            ids = workspace.topk_idx.clone()
-            for _ in range(3):
-                workspace.topk_idx.fill_(-1)
-                graph.replay()
-                torch.cuda.synchronize()
-                assert not captured.any()
-                workspace.topk_idx.copy_(ids)
-                graph.replay()
-                torch.cuda.synchronize()
-                assert torch.equal(
-                    captured.view(torch.uint8), baseline.view(torch.uint8)
-                )
-        finally:
-            workspace.destroy()
-
-
-@pytest.mark.arch_blackwell
-def test_dispatch_dedup_tactic_switch_is_bit_exact():
-    _require_b200()
-    workspace, launch, expected = _full_kernel_case(
-        33,
-        256,
-        256,
-        8,
-        8,
-        knobs={"dispatch_dedup": False},
-        capacity_tactics=[{"dispatch_dedup": False}, {"dispatch_dedup": True}],
-    )
-    try:
-        baseline = launch().clone()
-        torch.testing.assert_close(baseline, expected, atol=0.015, rtol=0.05)
-        for enabled in (True, False, True):
-            workspace.apply_knobs({"dispatch_dedup": enabled})
-            assert torch.equal(launch().view(torch.uint8), baseline.view(torch.uint8))
-        assert len(workspace._frontends) == 2
-    finally:
-        workspace.destroy()
-
-
-@pytest.mark.arch_blackwell
-@pytest.mark.parametrize("mma_m,tile_tokens", [(128, 64), (256, 64), (256, 192)])
-@pytest.mark.parametrize(
-    "load_balance_mode", ["static", "atomic_counter", "alternating"]
-)
-@pytest.mark.parametrize("tokens", [0, 33, 2048])
-def test_startup_prefetch_bitwise_graph_relaunch(
-    mma_m, tile_tokens, load_balance_mode, tokens
-):
-    _require_b200()
-    knobs = dict(
-        mma_tiler_mnk=(mma_m, tile_tokens, 128),
-        load_balance_mode=load_balance_mode,
-        startup_prefetch_waves=0,
-    )
-    workspace, launch, expected = _full_kernel_case(
-        tokens, 256, 1024, 32, 4, knobs=knobs
-    )
-    try:
-        baseline = launch().clone()
-        torch.testing.assert_close(baseline, expected, atol=0.015, rtol=0.05)
-        for waves in (1, 2, 3, 0):
-            workspace.apply_knobs(dict(knobs, startup_prefetch_waves=waves))
-            assert torch.equal(launch().view(torch.uint8), baseline.view(torch.uint8))
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
-                actual = launch()
-            for _ in range(5):
-                graph.replay()
-            assert torch.equal(actual.view(torch.uint8), baseline.view(torch.uint8))
-    finally:
-        workspace.destroy()
-
-
-@pytest.mark.arch_blackwell
-@pytest.mark.parametrize("experts", [3, 32])
-@pytest.mark.parametrize("epilogue_warps", [4, 8])
-def test_vector_count_publish_bitwise_relaunch(experts, epilogue_warps):
-    _require_b200()
-    knobs = dict(epilogue_warps=epilogue_warps, vector_count_publish=False)
-    workspace, launch, expected = _full_kernel_case(
-        129, 256, 256, experts, 2, knobs=knobs
-    )
-    try:
-        baseline = launch().clone()
-        torch.testing.assert_close(baseline, expected, atol=0.015, rtol=0.05)
-        workspace.apply_knobs(dict(knobs, vector_count_publish=True))
-        assert torch.equal(launch().view(torch.uint8), baseline.view(torch.uint8))
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            actual = launch()
-        for _ in range(100):
-            graph.replay()
-        assert torch.equal(actual.view(torch.uint8), baseline.view(torch.uint8))
+            workspace.apply_knobs(tactics[0])
     finally:
         workspace.destroy()
 
@@ -965,14 +727,12 @@ def test_vector_count_publish_bitwise_relaunch(experts, epilogue_warps):
         (8, 192, "alternating"),
     ],
 )
-@pytest.mark.parametrize("token_back_mode", ["epi_warps", "reuse_dispatch_warps"])
 def test_startup_fixes_bitwise_graph_relaunch(
-    tokens, experts, epilogue_warps, tile_tokens, load_balance_mode, token_back_mode
+    tokens, experts, epilogue_warps, tile_tokens, load_balance_mode
 ):
     _require_b200()
     knobs = dict(
         epilogue_warps=epilogue_warps,
-        token_back_mode=token_back_mode,
         mma_tiler_mnk=(256, tile_tokens, 128),
         load_balance_mode=load_balance_mode,
     )
@@ -982,21 +742,193 @@ def test_startup_fixes_bitwise_graph_relaunch(
     try:
         baseline = launch().clone()
         torch.testing.assert_close(baseline, expected, atol=0.015, rtol=0.05)
-        for local_counts, overlap in ((True, False), (False, True), (True, True)):
-            workspace.apply_knobs(
-                dict(
-                    knobs,
-                    cta_local_counts=local_counts,
-                    overlap_dispatch_pull=overlap,
-                    vector_count_publish=True,
-                )
-            )
-            assert torch.equal(launch().view(torch.uint8), baseline.view(torch.uint8))
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
-                actual = launch()
-            for _ in range(12):
-                graph.replay()
-            assert torch.equal(actual.view(torch.uint8), baseline.view(torch.uint8))
+        workspace.apply_knobs(dict(knobs, cta_local_counts=True))
+        assert torch.equal(launch().view(torch.uint8), baseline.view(torch.uint8))
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            actual = launch()
+        for _ in range(12):
+            graph.replay()
+        assert torch.equal(actual.view(torch.uint8), baseline.view(torch.uint8))
     finally:
         workspace.destroy()
+
+
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize("mode", ["static", "atomic_counter", "alternating"])
+@pytest.mark.parametrize("mma_m", [128, 256])
+def test_persistent_grid_bounds_are_bit_exact(mode: str, mma_m: int) -> None:
+    """Exercise single-cluster synchronization and occupancy clamping."""
+    _require_b200()
+    baseline = None
+    for clusters in (None, 1, 64, 1000):
+        workspace, launch, expected = _full_kernel_case(
+            33,
+            256,
+            256,
+            4,
+            2,
+            knobs={
+                "load_balance_mode": mode,
+                "persistent_clusters": clusters,
+                "mma_tiler_mnk": (mma_m, 64, 128),
+            },
+        )
+        try:
+            actual = launch().clone()
+            torch.testing.assert_close(actual, expected, atol=0.015, rtol=0.05)
+            if baseline is None:
+                baseline = actual
+            assert torch.equal(actual.view(torch.uint8), baseline.view(torch.uint8))
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                result = launch()
+            for _ in range(3):
+                graph.replay()
+                assert torch.equal(result.view(torch.uint8), baseline.view(torch.uint8))
+        finally:
+            workspace.destroy()
+
+
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize("in_kernel_reduce", [False, True])
+@pytest.mark.parametrize("tokens", [0, 1, 33, 129, 257])
+def test_per_route_output_reuse_and_graph(tokens, in_kernel_reduce):
+    _require_b200()
+    knobs = {"in_kernel_reduce": in_kernel_reduce}
+    workspace, launch, expected = _full_kernel_case(
+        tokens, 256, 128, 4, 2, knobs=knobs, output_mode="per_route"
+    )
+    try:
+        # Poison masked slots to expose stale workspace values.
+        workspace.route_terms.fill_(float("nan"))
+        workspace.y.fill_(42)
+        actual = launch()
+        assert actual.shape == (tokens, 2, 256)
+        assert actual.dtype == torch.bfloat16
+        if tokens:
+            assert actual.data_ptr() == workspace.route_terms.data_ptr()
+        torch.testing.assert_close(actual, expected, atol=0.015, rtol=0.05)
+        baseline = actual.clone()
+        assert bool((workspace.y == 42).all())
+        owned = torch.empty_like(actual)
+        assert launch(owned) is owned
+        torch.testing.assert_close(owned, baseline, atol=0, rtol=0)
+        with pytest.raises(ValueError, match="per-route output"):
+            launch(torch.empty((tokens, 256), device="cuda", dtype=torch.bfloat16))
+        # Even NaN scores must have no effect on per-route outputs.
+        workspace.topk_weights.fill_(float("nan"))
+        torch.testing.assert_close(launch(), baseline, atol=0, rtol=0)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = launch()
+        ids = workspace.topk_idx.clone()
+        for _ in range(2):
+            workspace.topk_idx.fill_(-1)
+            graph.replay()
+            assert torch.count_nonzero(captured) == 0
+            workspace.topk_idx.copy_(ids)
+            graph.replay()
+            torch.testing.assert_close(captured, baseline, atol=0, rtol=0)
+    finally:
+        workspace.destroy()
+
+
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize("in_kernel_reduce", [False, True])
+def test_per_route_matches_combined_terms(in_kernel_reduce):
+    _require_b200()
+    combined, combined_launch, _ = _full_kernel_case(
+        33, 256, 128, 4, 2, knobs={"in_kernel_reduce": in_kernel_reduce}
+    )
+    routes, routes_launch, _ = _full_kernel_case(
+        33,
+        256,
+        128,
+        4,
+        2,
+        knobs={"in_kernel_reduce": in_kernel_reduce},
+        output_mode="per_route",
+    )
+    try:
+        expected = combined_launch().clone()
+        actual = routes_launch()
+        mask = routes.topk_idx != -1
+        torch.testing.assert_close(
+            actual[mask], combined.route_terms[mask], atol=0, rtol=0
+        )
+        # Reconstruct the contract's ordered FP32 weighted sum independently.
+        reduced = torch.zeros_like(expected, dtype=torch.float32)
+        for slot in range(2):
+            reduced += actual[:, slot].float() * routes.topk_weights[:, slot, None]
+        torch.testing.assert_close(reduced.to(torch.bfloat16), expected, atol=0, rtol=0)
+    finally:
+        routes.destroy()
+        combined.destroy()
+
+
+@pytest.mark.arch_blackwell
+def test_per_route_public_layer_owned_view_and_partial_capacity():
+    _require_b200()
+    from flashinfer.moe_ep import (
+        BootstrapConfig,
+        FleetParams,
+        MegaConfig,
+        MoEEpMegaLayer,
+        MoEEpTensors,
+        MoEWeightPack,
+    )
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.mxfp8_mxfp4_bf16_cutedsl.config import (
+        Sm100_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
+    )
+    from flashinfer.moe_ep.cute_dsl.megamoe.mxfp8_mxfp4.integration import (
+        create_dummy_mxfp8_mxfp4_inputs,
+        mxfp8_mxfp4_mega_moe,
+    )
+
+    _, fc1, fc2, source = create_dummy_mxfp8_mxfp4_inputs(
+        0, 1, 4, 16, 7, 2, 256, 128, output_mode="per_route", capacity_tactics=[{}]
+    )
+    layer = None
+    try:
+        expected = mxfp8_mxfp4_mega_moe(None, fc1, fc2, source, num_tokens=7).clone()
+        inputs = MoEEpTensors(
+            hidden_states=source.x[:7],
+            scales=source.x_sf[:7],
+            topk_ids=source.topk_idx[:7],
+            topk_weights=source.topk_weights[:7],
+        )
+        layer = MoEEpMegaLayer(
+            BootstrapConfig(world_size=1, rank=0, auto_bootstrap=False),
+            FleetParams(num_experts=4, max_tokens_per_rank=16, token_hidden_size=256),
+            MoEWeightPack(w13=fc1[0], w2=fc2[0]),
+            MegaConfig(
+                megakernel=Sm100_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig(
+                    intermediate_size=128, top_k=2, output_mode="per_route", knobs={}
+                ),
+                transformed_weights=(fc1, fc2),
+                quantize_input=False,
+            ),
+        )
+        profile = layer.create_workspace(32)
+        layer.warmup(inputs, workspace=profile)
+        owned = layer(inputs, workspace=profile)
+        view = layer(inputs, workspace=profile, return_workspace_view=True)
+        assert owned.shape == (7, 2, 256)
+        assert owned.data_ptr() != view.data_ptr()
+        torch.testing.assert_close(owned, expected, atol=0, rtol=0)
+        torch.testing.assert_close(view, expected, atol=0, rtol=0)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = layer(inputs, workspace=profile)
+        inputs.topk_ids.fill_(-1)
+        for _ in range(2):
+            graph.replay()
+            assert torch.count_nonzero(captured) == 0
+        # Borrowed storage was reused; the earlier owned result survives.
+        assert torch.count_nonzero(view) == 0
+        torch.testing.assert_close(owned, expected, atol=0, rtol=0)
+    finally:
+        if layer is not None:
+            layer.destroy()
+        source.destroy()

@@ -17,10 +17,6 @@ from flashinfer.moe_ep.cute_dsl.megamoe.mxfp8_mxfp4.device_epilogue import (
     PersistentMxfp8Mxfp4Epilogue,
 )
 
-from flashinfer.moe_ep.cute_dsl.megamoe.mxfp8_mxfp4.fc1_store import (
-    fc1_store_layout,
-    store_native_e4m3,
-)
 from flashinfer.moe_ep.cute_dsl.megamoe.mxfp8_mxfp4.fc2_store import (
     stage_native_bf16,
 )
@@ -131,22 +127,17 @@ class _NativeLoadPattern:
                                 lane,
                                 half,
                                 chunk,
-                                self.store_mode,
                             )
                         barrier.arrive_and_wait()
                         for row in cutlass.range_constexpr(16):
                             token = row + chunk * 16
-                            if cutlass.const_expr(self.store_mode == "staged64"):
-                                byte_offset = warp * 1024 + row * 64 + lane * 2
-                                mask = 0x30
-                            else:
-                                byte_offset = (
-                                    (warp // 4) * 4096
-                                    + row * 256
-                                    + (warp % 4) * 64
-                                    + lane * 2
-                                )
-                                mask = 0x70
+                            byte_offset = (
+                                (warp // 4) * 4096
+                                + row * 256
+                                + (warp % 4) * 64
+                                + lane * 2
+                            )
+                            mask = 0x70
                             offset = byte_offset ^ ((byte_offset >> 3) & mask)
                             output[stage, group, warp, token, lane] = staging[
                                 offset // 2
@@ -176,10 +167,9 @@ def test_native_fc1_tmem_element_mapping(tokens, warps):
     torch.testing.assert_close(output.cpu(), (row * 1024 + col).float(), rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("mode", ["staged64", "staged256"])
 @pytest.mark.parametrize("tokens", [64, 128, 192])
 @pytest.mark.parametrize("warps,padding", [(4, 0), (8, 16), (8, 128)])
-def test_native_fc2_tmem_to_bf16_shared_mapping(mode, tokens, warps, padding):
+def test_native_fc2_tmem_to_bf16_shared_mapping(tokens, warps, padding):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
         pytest.skip("requires SM100/SM103")
     output = torch.empty(
@@ -187,85 +177,13 @@ def test_native_fc2_tmem_to_bf16_shared_mapping(mode, tokens, warps, padding):
     )
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     view = from_dlpack(output)
-    run = cute.compile(_NativeLoadPattern(tokens, warps, mode, padding), view, stream)
+    run = cute.compile(
+        _NativeLoadPattern(tokens, warps, "staged256", padding), view, stream
+    )
     run(view, stream)
     stage, group, warp, token, feature = torch.meshgrid(
         *[torch.arange(n, device="cuda") for n in output.shape], indexing="ij"
     )
     value = ((warp % 4) * 32 + feature) * 1024 + stage * tokens + group * 32 + token
     expected = ((value % 251 - 125).float() * 0.0313).bfloat16()
-    torch.testing.assert_close(output, expected, rtol=0, atol=0)
-
-
-class _NativeStorePattern:
-    def __init__(self, warps, padding):
-        self.warps = warps
-        self.padding = padding
-
-    @cute.jit
-    def __call__(self, output, stream):
-        self.kernel(output).launch(
-            grid=(1, 1, 1), block=(self.warps * 32, 1, 1), stream=stream
-        )
-
-    @cute.kernel
-    def kernel(self, output):
-        tid, _, _ = cute.arch.thread_idx()
-        warp, lane = tid // 32, tid % 32
-        smem = cutlass.utils.SmemAllocator()
-        if cutlass.const_expr(self.padding):
-            smem.allocate_tensor(cutlass.Uint8, cute.make_layout(self.padding), 128)
-        layout = fc1_store_layout(self.warps // 4)
-        staged = smem.allocate_tensor(
-            cutlass.Uint8, layout.outer, byte_alignment=128, swizzle=layout.inner
-        )
-        for buffer in cutlass.range_constexpr(2):
-            stage = staged[None, None, buffer, warp // 4]
-            raw = cute.make_rmem_tensor((16,), cutlass.Uint8)
-            for i in cutlass.range_constexpr(4):
-                token = (lane % 4) * 2 + i * 8
-                feature = (warp % 4) * 16 + lane // 4
-                salt = buffer * 19 + (warp // 4) * 37
-                raw[i * 4] = (token * 7 + feature * 3 + salt).to(cutlass.Uint8)
-                raw[i * 4 + 1] = ((token + 1) * 7 + feature * 3 + salt).to(
-                    cutlass.Uint8
-                )
-                raw[i * 4 + 2] = (token * 7 + (feature + 8) * 3 + salt).to(
-                    cutlass.Uint8
-                )
-                raw[i * 4 + 3] = ((token + 1) * 7 + (feature + 8) * 3 + salt).to(
-                    cutlass.Uint8
-                )
-            regs = cute.recast_tensor(raw, cutlass.Uint32)
-            store_native_e4m3(
-                stage.iterator,
-                cute.crd2idx((lane, (warp % 4) * 16), stage.layout),
-                regs[0],
-                regs[1],
-                regs[2],
-                regs[3],
-            )
-        cute.arch.sync_threads()
-        for buffer in cutlass.range_constexpr(2):
-            for i in cutlass.range_constexpr(16):
-                index = tid % 128 + i * 128
-                output[buffer, warp // 4, index // 64, index % 64] = staged[
-                    index // 64, index % 64, buffer, warp // 4
-                ]
-
-
-@pytest.mark.parametrize("warps", [4, 8])
-@pytest.mark.parametrize("padding", [0, 128, 256, 384])
-def test_native_fc1_stsm_element_mapping(warps, padding):
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
-        pytest.skip("requires SM100/SM103")
-    output = torch.empty((2, warps // 4, 32, 64), dtype=torch.uint8, device="cuda")
-    view = from_dlpack(output)
-    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    run = cute.compile(_NativeStorePattern(warps, padding), view, stream)
-    run(view, stream)
-    buffer, group, token, feature = torch.meshgrid(
-        *[torch.arange(n, device="cuda") for n in output.shape], indexing="ij"
-    )
-    expected = (buffer * 19 + group * 37 + token * 7 + feature * 3).to(torch.uint8)
     torch.testing.assert_close(output, expected, rtol=0, atol=0)

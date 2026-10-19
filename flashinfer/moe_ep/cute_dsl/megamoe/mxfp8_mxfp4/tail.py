@@ -23,16 +23,16 @@ from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.src.src.ptx_helpers impo
     red_add_release_sys_s32_raw,
 )
 
-from .wait_stats import Slot, globaltimer_lo
+from .wait_stats import Slot, SLOTS, globaltimer_lo
 
 
 @dsl_user_op
-def _store_count_pair(addr: Int64, first: Int64, second: Int64, *, loc=None, ip=None):
+def _startup_phase_assert(actual, expected, *, loc=None, ip=None):
     llvm.inline_asm(
         None,
-        [addr.ir_value(), first.ir_value(), second.ir_value()],
-        "st.global.v2.b64 [$0], {$1, $2};",
-        "l,l,l",
+        [actual.ir_value(), expected.ir_value()],
+        "{ .reg .pred p; setp.ne.s32 p, $0, $1; @p trap; }",
+        "r,r",
         has_side_effects=True,
         asm_dialect=0,
         loc=loc,
@@ -43,7 +43,6 @@ def _store_count_pair(addr: Int64, first: Int64, second: Int64, *, loc=None, ip=
 def overwrite_count_token_comm_class(base: Any) -> type:
     class OverwriteCountTokenComm(base):  # type: ignore[misc, valid-type]
         overwrite_counts = True
-        vector_count_publish = False
         cta_local_counts = False
 
         @cute.jit
@@ -72,6 +71,17 @@ def overwrite_count_token_comm_class(base: Any) -> type:
                 startup_status = cute.arch.load(
                     nvlink_barrier_counter.iterator, Int32, sem="relaxed", scope="gpu"
                 ) & Int32(3)
+                if cutlass.const_expr(hasattr(self, "_stamp")):
+                    if warp_idx == Int32(0) and lane_idx == Int32(0):
+                        phase_ptr = (
+                            grid_sync_counter.iterator
+                            + Int32(self.stats_word_offsets["grid_sync_counter"])
+                            + sm_idx * Int32(SLOTS)
+                            + Int32(Slot.STARTUP_PHASE_RAW)
+                        )
+                        cute.make_tensor(phase_ptr, cute.make_layout(1))[0] = (
+                            startup_status
+                        )
 
             if cutlass.const_expr(hasattr(self, "_stamp")):
                 grid_start = globaltimer_lo()
@@ -82,6 +92,20 @@ def overwrite_count_token_comm_class(base: Any) -> type:
                 tid_in_group,
                 num_threads=self.num_dispatch_threads,
             )
+
+            if cutlass.const_expr(self.cta_local_counts and hasattr(self, "_stamp")):
+                if warp_idx == Int32(0) and lane_idx == Int32(0):
+                    # The first grid sync orders CTA 0's debug snapshot. Unlike
+                    # the live barrier counter, it cannot advance during acquire.
+                    phase_ptr = (
+                        grid_sync_counter.iterator
+                        + Int32(self.stats_word_offsets["grid_sync_counter"])
+                        + Int32(Slot.STARTUP_PHASE_RAW)
+                    )
+                    expected_phase = cute.arch.load(
+                        phase_ptr, Int32, sem="relaxed", scope="gpu"
+                    )
+                    _startup_phase_assert(startup_status, expected_phase)
 
             if cutlass.const_expr(hasattr(self, "_stamp")):
                 send_start = globaltimer_lo()
@@ -95,81 +119,33 @@ def overwrite_count_token_comm_class(base: Any) -> type:
                     send_start - grid_start,
                 )
             if sm_idx == 0:
-                if cutlass.const_expr(
-                    self.vector_count_publish and self.num_experts_per_rank % 2 == 0
+                for offset in cutlass.range_constexpr(
+                    0,
+                    self.num_total_experts,
+                    self.experts_per_dispatch_pass,
                 ):
-                    # Each lane publishes two adjacent counts. Even local expert
-                    # counts keep every rank's row 16-byte aligned and ensure a
-                    # vector never crosses an owner boundary. Odd rows retain
-                    # the scalar path. The release fence/barriers are unchanged.
-                    for offset in cutlass.range_constexpr(
-                        0, self.num_total_experts // 2, self.num_dispatch_threads
-                    ):
-                        expert_id = (Int32(offset) + tid_in_group) * Int32(2)
-                        if expert_id < Int32(self.num_total_experts):
-                            dst_rank = expert_id // Int32(self.num_experts_per_rank)
-                            local_expert = expert_id % Int32(self.num_experts_per_rank)
-                            first = cute.arch.load(
-                                expert_send_count.iterator + expert_id,
-                                Int64,
-                                sem="relaxed",
-                                scope="gpu",
-                            )
-                            second = cute.arch.load(
-                                expert_send_count.iterator + expert_id + 1,
-                                Int64,
-                                sem="relaxed",
-                                scope="gpu",
-                            )
-                            addr = peer_rank_ptr_mapper.map(
-                                expert_recv_count.iterator.toint(),
-                                dst_rank,
-                                Int64(
-                                    (
-                                        Int32(local_rank)
-                                        * Int32(self.num_experts_per_rank)
-                                        + local_expert
-                                    )
-                                    * Int32(8)
-                                ),
-                            )
-                            _store_count_pair(
-                                addr,
-                                first & Int64(0xFFFFFFFF),
-                                second & Int64(0xFFFFFFFF),
-                            )
-                else:
-                    for offset in cutlass.range_constexpr(
-                        0,
-                        self.num_total_experts,
-                        self.experts_per_dispatch_pass,
-                    ):
-                        expert_id = Int32(
-                            offset + warp_idx * self.warp_threads + lane_idx
+                    expert_id = Int32(offset + warp_idx * self.warp_threads + lane_idx)
+                    if expert_id < Int32(self.num_total_experts):
+                        dst_rank = expert_id // Int32(self.num_experts_per_rank)
+                        dst_local_expert = expert_id % Int32(self.num_experts_per_rank)
+                        status_u64 = cute.arch.load(
+                            expert_send_count.iterator + expert_id,
+                            Int64,
+                            sem="relaxed",
+                            scope="gpu",
                         )
-                        if expert_id < Int32(self.num_total_experts):
-                            dst_rank = expert_id // Int32(self.num_experts_per_rank)
-                            dst_local_expert = expert_id % Int32(
-                                self.num_experts_per_rank
-                            )
-                            status_u64 = cute.arch.load(
-                                expert_send_count.iterator + expert_id,
-                                Int64,
-                                sem="relaxed",
-                                scope="gpu",
-                            )
-                            token_count_u32 = Int32(status_u64 & Int64(0xFFFFFFFF))
-                            erc_local_base = expert_recv_count.iterator.toint()
-                            erc_elem_off = (
-                                Int32(local_rank) * Int32(self.num_experts_per_rank)
-                                + dst_local_expert
-                            ) * Int32(8)
-                            erc_peer_addr = peer_rank_ptr_mapper.map(
-                                erc_local_base,
-                                dst_rank,
-                                Int64(erc_elem_off),
-                            )
-                            stg_b64_raw(erc_peer_addr, Int64(token_count_u32))
+                        token_count_u32 = Int32(status_u64 & Int64(0xFFFFFFFF))
+                        erc_local_base = expert_recv_count.iterator.toint()
+                        erc_elem_off = (
+                            Int32(local_rank) * Int32(self.num_experts_per_rank)
+                            + dst_local_expert
+                        ) * Int32(8)
+                        erc_peer_addr = peer_rank_ptr_mapper.map(
+                            erc_local_base,
+                            dst_rank,
+                            Int64(erc_elem_off),
+                        )
+                        stg_b64_raw(erc_peer_addr, Int64(token_count_u32))
                 cute.arch.fence_acq_rel_sys()
             cute.arch.barrier(
                 barrier_id=self.dispatch_intra_cta_bar_id,

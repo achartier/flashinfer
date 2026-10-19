@@ -91,14 +91,13 @@ def test_device_epilogue_owns_pipeline_and_publication() -> None:
 def test_device_epilogue_reuses_numerical_primitives() -> None:
     source = inspect.getsource(PersistentMxfp8Mxfp4Epilogue)
     assert "Fc1Epilogue" in source
-    assert "Fc2Bf16Epilogue" in source
     assert "_clamp_and_swiglu(" in source
-    assert ".fc2_subtile.store_rmem_subtile(" in source
+    assert "stage_native_bf16(" in source
+    assert "store_staged_vector(" in source
 
 
 def test_device_epilogue_exchanges_paired_native_feature_warps() -> None:
     source = inspect.getsource(PersistentMxfp8Mxfp4Epilogue)
-    assert "_load_native_feature_group" in source
-    assert "_transpose_to_token_major" in source
+    assert "_load_fc1_native_half" in source
     assert "epilogue_exchange" in source
     assert "pair_idx" in source

@@ -92,9 +92,9 @@ def test_eight_warp_register_budget(mega) -> None:
 
 def test_driver_wires_native_mma_and_readiness_protocols() -> None:
     source = inspect.getsource(PersistentM128DeviceDriver)
-    # Dynamic-N issue is the default; the static full-N path stays for A/B.
+    # Dynamic-N issue is the only MMA path.
     assert "issue_dynamic_block_scaled_mma_tile(" in source
-    assert "cute.gemm(" in source
+    assert "cute.gemm(" not in source
     assert "work.peek_ready" in source
     assert "fc1_ready_counter_ptr" in source
     assert "fc1_done_counter_ptr" in source

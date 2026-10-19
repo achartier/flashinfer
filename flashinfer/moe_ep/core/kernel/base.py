@@ -209,6 +209,12 @@ class MegaKernelBackend(ABC):
     ) -> None:
         """Optional per-iteration validation before staging/compute."""
 
+    def output_shape(
+        self, num_tokens: int, fleet_params: "FleetParams"
+    ) -> tuple[int, ...]:
+        """Shape of the BF16 tensor returned by this backend."""
+        return (num_tokens, fleet_params.token_hidden_size)
+
     def validate_capture_ready(  # noqa: B027 - intentional no-op default
         self,
         workspace: Any,

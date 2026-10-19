@@ -74,10 +74,9 @@ def test_pipeline_contract_is_m128_or_m256_block32() -> None:
     assert KernelWarpIds().threads_per_cta == 12 * 32
 
 
-@pytest.mark.parametrize("mode", ["direct", "staged64", "staged256"])
 @pytest.mark.parametrize("warps", [4, 8])
 @pytest.mark.parametrize("n", [64, 128, 192])
-def test_fc2_staging_stage_fit(mode, warps, n):
+def test_fc2_staging_stage_fit(warps, n):
     kwargs = dict(
         mma_tiler_mnk=(256, n, 128),
         scheduler_params=SimpleNamespace(num_stages=2, load_balance_mode="static"),
@@ -86,25 +85,18 @@ def test_fc2_staging_stage_fit(mode, warps, n):
         smem_capacity_bytes=SM100_SMEM_CAPACITY,
         maximum_stages=12,
     )
-    fit = fit_operand_stages(**kwargs, fc2_store_mode=mode)
+    fit = fit_operand_stages(**kwargs)
     storage = KernelPipelines.build_shared_storage_type(
         num_ab_stages=fit.stages,
         num_acc_stages=2,
         scheduler_params=kwargs["scheduler_params"],
         dispatch_phase=kwargs["dispatch_phase"],
         epilogue_warps=warps,
-        fc2_store_mode=mode,
     )
     assert fit.fixed_bytes == (storage.__sizeof__() + 127) // 128 * 128
     assert fit.used_bytes <= SM100_SMEM_CAPACITY
-    baseline = fit_operand_stages(**kwargs)
-    assert fit.stages <= baseline.stages
-    if mode != "direct":
-        assert fit.fixed_bytes >= warps * 1024
-    if mode != "direct" and n == 128:
-        # The two 16-row chunks preserve this N128 fixture's stage depth;
-        # a full 32-row buffer costs one operand stage with eight warps.
-        assert fit.stages == baseline.stages
+    # 16 x 32 BF16 staging values per warp alias the FC1 exchange.
+    assert fit.fixed_bytes >= warps * 1024
 
 
 @pytest.mark.parametrize("mega", [False, True])
@@ -127,9 +119,7 @@ def test_epilogue_rejects_mixed_role_warpgroups() -> None:
 
 @pytest.mark.parametrize("mega", [False, True])
 @pytest.mark.parametrize("n", [64, 128, 192])
-def test_eight_warp_stage_fit_sizes_exchange_storage(mega, n, monkeypatch) -> None:
-    monkeypatch.setenv("FLASHINFER_MXFP8_MXFP4_FC1_TMA_STORE", "1")
-    monkeypatch.delenv("FLASHINFER_MXFP8_MXFP4_FC1_EPI_LEGACY", raising=False)
+def test_eight_warp_stage_fit_sizes_exchange_storage(mega, n) -> None:
     kwargs: dict[str, Any] = dict(
         mma_tiler_mnk=(256, n, 128),
         scheduler_params=SimpleNamespace(num_stages=2, load_balance_mode="static"),
@@ -139,8 +129,8 @@ def test_eight_warp_stage_fit_sizes_exchange_storage(mega, n, monkeypatch) -> No
     )
     four = fit_operand_stages(**kwargs, epilogue_warps=4)
     eight = fit_operand_stages(**kwargs, epilogue_warps=8)
-    # Two additional pairs each exchange 2 x 32 FP32 maxima.
-    assert eight.fixed_bytes - four.fixed_bytes == 512 + 4096
+    # Four more warps each stage 16 x 32 BF16 values for FC2.
+    assert eight.fixed_bytes - four.fixed_bytes == 4096
     assert eight.stages <= four.stages
     assert eight.used_bytes <= SM100_SMEM_CAPACITY
 
@@ -188,7 +178,6 @@ class _PipelineTraceHarness:
         assert pipelines.staging.tma_transaction_bytes_a() == 128 * 128 // 2 + 512
         smem = cutlass.utils.SmemAllocator()
         storage = smem.allocate(pipelines.shared_storage_type())
-        pipelines.allocate_fc1_store_smem(smem)
         pipelines.allocate_operand_smem(smem)
         pipelines.create_mainloop_pipelines(storage)
 
@@ -215,7 +204,6 @@ class _TwoCtaPipelineTraceHarness:
         assert stage_bytes == mma_operand_stage_bytes((256, self.mma_n, 128))
         smem = cutlass.utils.SmemAllocator()
         storage = smem.allocate(pipelines.shared_storage_type())
-        pipelines.allocate_fc1_store_smem(smem)
         pipelines.allocate_operand_smem(smem)
         pipelines.create_mainloop_pipelines(storage)
 
@@ -261,8 +249,6 @@ def _ep16_dispatch(hidden: int) -> Mxfp8DispatchPhase:
         sf_padding_block=128,
         cluster_tile_tokens=128,
         load_balance_mode="static",
-        token_back_by_dispatch=False,
-        token_back_schedule_mode="static",
     )
     return Mxfp8DispatchPhase(
         workspace,
@@ -284,12 +270,11 @@ def _fit(hidden: int, capacity: int, maximum_stages: int = 8) -> int:
     ).stages
 
 
-def test_stage_fit_capacity_boundary(monkeypatch) -> None:
-    monkeypatch.setenv("FLASHINFER_MXFP8_MXFP4_FC1_TMA_STORE", "0")
+def test_stage_fit_capacity_boundary() -> None:
     # Check the exact allocation boundary for a synthetic dispatch shape.
-    assert _fit(6400, 229376, maximum_stages=6) == 6
-    assert _fit(6400, 229375, maximum_stages=6) == 5
-    assert _fit(6400, SM100_SMEM_CAPACITY) == 6
+    assert _fit(6400, 232960, maximum_stages=6) == 6
+    assert _fit(6400, 232959, maximum_stages=6) == 5
+    assert _fit(6400, SM100_SMEM_CAPACITY) == 5
     assert _fit(256, SM100_SMEM_CAPACITY) == 6
 
 
@@ -324,7 +309,6 @@ class _StageFitLaunchHarness:
         )
         smem = cutlass.utils.SmemAllocator()
         smem.allocate(pipelines.shared_storage_type())
-        pipelines.allocate_fc1_store_smem(smem)
         pipelines.allocate_operand_smem(smem)
 
 
@@ -343,42 +327,3 @@ def test_b200_stage_fit_boundary_matches_launch_limit() -> None:
     with pytest.raises(Exception, match="(?i)shared memory|CUDA_ERROR_INVALID_VALUE"):
         cute.compile(_StageFitLaunchHarness(fitted + 1, 6400), stream)(stream)
         torch.cuda.synchronize()
-
-
-@pytest.mark.parametrize("hidden", [4096, 6400])
-@pytest.mark.parametrize("warps", [4, 8])
-@pytest.mark.parametrize("n", [64, 128, 192])
-def test_dispatch_dedup_keeps_operand_stage_budget(hidden, warps, n):
-    fits = []
-    for enabled in (False, True):
-        workspace = WorkspaceConfig(
-            world_size=16,
-            num_topk=8,
-            num_experts_per_rank=32,
-            max_tokens_per_rank=1024,
-            hidden=hidden,
-            intermediate=6400,
-            token_padding_block=64,
-            sf_padding_block=128,
-            cluster_tile_tokens=n,
-            dispatch_dedup=enabled,
-        )
-        dispatch = Mxfp8DispatchPhase(
-            workspace,
-            cluster_shape_mn=(2, 1),
-            dispatch_warp_start=8,
-            num_other_warps=warps + 4,
-        )
-        fits.append(
-            fit_operand_stages(
-                mma_tiler_mnk=(256, n, 128),
-                scheduler_params=SimpleNamespace(
-                    num_stages=2, load_balance_mode="static"
-                ),
-                dispatch_phase=dispatch,
-                epilogue_warps=warps,
-                smem_capacity_bytes=SM100_SMEM_CAPACITY,
-                maximum_stages=12,
-            )
-        )
-    assert fits[0] == fits[1]

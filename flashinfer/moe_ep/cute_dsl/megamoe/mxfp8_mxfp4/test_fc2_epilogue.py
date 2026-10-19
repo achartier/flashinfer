@@ -9,7 +9,6 @@ pytest.importorskip("cutlass")
 from flashinfer.moe_ep.cute_dsl.megamoe.mxfp8_mxfp4.fc2_epilogue import (  # noqa: E402
     DeterministicTopKReducer,
     FC2_EPILOGUE_TILE,
-    Fc2Bf16Epilogue,
     Fc2RouteStore,
     REDUCE_HIDDEN_PER_THREAD,
     validate_fc2_contract,
@@ -36,10 +35,18 @@ def test_route_store_exposes_the_same_local_and_peer_slot_layout() -> None:
 
 
 def test_fc2_store_interface_cannot_accept_a_routing_score() -> None:
-    parameters = inspect.signature(Fc2Bf16Epilogue.store_rmem_subtile).parameters
-    assert "route_score" not in parameters
-    assert "topk_score" not in parameters
-    assert "src_topk_idx" in parameters
+    from flashinfer.moe_ep.cute_dsl.megamoe.mxfp8_mxfp4.fc2_store import (
+        stage_native_bf16,
+        store_staged_vector,
+    )
+
+    for function in (stage_native_bf16, store_staged_vector):
+        parameters = inspect.signature(function).parameters
+        assert "route_score" not in parameters
+        assert "topk_score" not in parameters
+    route = inspect.signature(Fc2RouteStore.resolve_route_row).parameters
+    assert "src_topk_idx" in route
+    assert "route_score" not in route
 
 
 def test_external_reducer_has_fixed_slot_geometry() -> None:

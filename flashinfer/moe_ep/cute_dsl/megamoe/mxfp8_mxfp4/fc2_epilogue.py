@@ -5,8 +5,9 @@
 
 The two operations in this module deliberately have separate interfaces:
 
-* :class:`Fc2Bf16Epilogue` rounds each unweighted FP32 FC2 accumulator to
-  BF16 exactly once and stores one row per ``(src_token_idx, src_topk_idx)``.
+* :class:`Fc2RouteStore` resolves the row of each ``(src_token_idx,
+  src_topk_idx)``; the persistent epilogue rounds each unweighted FP32 FC2
+  accumulator to BF16 exactly once and stores it there.
 * :class:`DeterministicTopKReducer` reads those BF16 route terms, converts
   them back to FP32, applies the FP32 routing score, accumulates top-k slots in
   increasing slot order, and rounds the final output to BF16 exactly once.
@@ -15,7 +16,7 @@ In particular, the route-store path has no routing-score operand.  This keeps
 routing after FC2 and prevents it from changing the FC1-to-FC2 MXFP8
 quantization point. Local and peer stores share the same route-slot layout.
 Reduction placement is selected by the integrating kernel's tactic; the
-persistent tail's pipelined implementation lives in :mod:`combine`.
+persistent tail runs :class:`InKernelTopKReduction`.
 
 The integrating kernel owns TMEM lifetime, accumulator-pipeline barriers,
 source metadata, and inter-rank completion signalling.  This component only
@@ -34,7 +35,6 @@ import cutlass
 import cutlass.cute as cute
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm
-from cutlass.cute.nvgpu import tcgen05
 from cutlass.cutlass_dsl import Float32, Int32, T, dsl_user_op
 
 
@@ -99,94 +99,6 @@ class Fc2RouteStore:
             src_rank,
         )
         return cute.make_tensor(peer_iter, local_row.layout)
-
-
-class Fc2Bf16Epilogue:
-    """Store unweighted FP32 FC2 accumulator subtiles as BF16 route terms."""
-
-    def __init__(self, *, hidden: int) -> None:
-        validate_fc2_contract(hidden=hidden, num_topk=1)
-        self.hidden = int(hidden)
-
-    @cute.jit
-    def store_rmem_subtile(
-        self,
-        r_acc: cute.Tensor,
-        route_store: Fc2RouteStore,
-        src_rank,
-        src_token_idx,
-        src_topk_idx,
-        hidden_col_start,
-    ) -> None:
-        """Round 32 FP32 accumulator cells once and store one route subtile.
-
-        ``hidden_col_start`` must be 32-aligned.  The static hidden contract
-        makes every subtile complete, so no partial vector store or second
-        conversion path exists.
-        """
-
-        # This is the sole route-term rounding point.  Keep it before any
-        # destination handling and do not add a routing-score argument here.
-        r_bf16 = cute.make_rmem_tensor((FC2_EPILOGUE_TILE,), cutlass.BFloat16)
-        r_bf16.store(r_acc.load().to(cutlass.BFloat16))
-
-        dest_row = route_store.resolve_route_row(
-            src_rank,
-            src_token_idx,
-            src_topk_idx,
-        )
-        dest_ptr = cute.make_ptr(
-            cutlass.BFloat16,
-            dest_row.iterator.toint() + cutlass.Int64(hidden_col_start) * 2,
-            cute.AddressSpace.gmem,
-            assumed_align=32,
-        )
-        stg_atom = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(),
-            cutlass.BFloat16,
-            num_bits_per_copy=256,
-        )
-        for half in cutlass.range_constexpr(FC2_EPILOGUE_TILE // 16):
-            src = cute.make_tensor(
-                r_bf16.iterator + half * 16,
-                cute.make_layout(16),
-            )
-            dst = cute.make_tensor(
-                dest_ptr + half * 16,
-                cute.make_layout(16),
-            )
-            cute.copy(stg_atom, src, dst)
-
-    @cute.jit
-    def load_tmem_and_store_subtile(
-        self,
-        tmem_subtile: cute.Tensor,
-        route_store: Fc2RouteStore,
-        src_rank,
-        src_token_idx,
-        src_topk_idx,
-        hidden_col_start,
-    ) -> None:
-        """Load one 32-cell FP32 TMEM subtile and emit its BF16 route term."""
-
-        r_acc_layout = cute.make_layout(
-            (((FC2_EPILOGUE_TILE,), 1),),
-            stride=(((1,), 0),),
-        )
-        r_acc = cute.make_rmem_tensor(r_acc_layout.shape, cutlass.Float32)
-        ldtm_atom = cute.make_copy_atom(
-            tcgen05.Ld32x32bOp(tcgen05.Repetition.x32),
-            cutlass.Float32,
-        )
-        cute.copy(ldtm_atom, tmem_subtile, r_acc)
-        self.store_rmem_subtile(
-            r_acc,
-            route_store,
-            src_rank,
-            src_token_idx,
-            src_topk_idx,
-            hidden_col_start,
-        )
 
 
 @dsl_user_op
@@ -328,8 +240,7 @@ class DeterministicTopKReducer:
     def reduce_worker(self, route_terms, route_scores, route_ids, output, worker_idx):
         """Reduce eight hidden values of one token (views from :meth:`views`).
 
-        Shared by the external kernel and the scalar in-kernel diagnostic.
-        The pipelined combine preserves this exact arithmetic order.
+        Shared by the external kernel and the in-kernel tail reduction.
         """
 
         token_idx = worker_idx // self.hidden_tiles
@@ -410,6 +321,34 @@ class DeterministicTopKReducer:
         )
 
 
+class ClearMaskedRouteTerms:
+    """Define -1 slots without clearing live FC2 stores or launching a kernel.
+
+    Runs after the peer drain. Each warp owns a route row, so valid routes
+    only cost one uniform predicate and never read or rewrite the payload.
+    """
+
+    def __init__(self, *, hidden, num_topk, route_terms):
+        self.hidden = hidden
+        self.num_topk = num_topk
+        self.route_terms = route_terms
+
+    @cute.jit
+    def __call__(self, args, cta_linear_id, tidx, threads_per_cta: cutlass.Constexpr):
+        terms = self.route_terms
+        lane = tidx % Int32(32)
+        row = cta_linear_id * Int32(threads_per_cta // 32) + tidx // Int32(32)
+        stride = Int32(args.sm_count * (threads_per_cta // 32))
+        total = args.topk_idx.shape[0] * Int32(self.num_topk)
+        while row < total:
+            token = row // Int32(self.num_topk)
+            slot = row % Int32(self.num_topk)
+            if args.topk_idx[token, slot] == -1:
+                for feature in cutlass.range_constexpr(0, self.hidden, 32):
+                    terms[token, slot, Int32(feature) + lane] = cutlass.BFloat16(0.0)
+            row = row + stride
+
+
 class InKernelTopKReduction:
     """Trace-time operands for the all-warp persistent tail callback."""
 
@@ -437,7 +376,6 @@ class InKernelTopKReduction:
 __all__ = [
     "DeterministicTopKReducer",
     "FC2_EPILOGUE_TILE",
-    "Fc2Bf16Epilogue",
     "Fc2RouteStore",
     "InKernelTopKReduction",
     "REDUCE_HIDDEN_PER_THREAD",
