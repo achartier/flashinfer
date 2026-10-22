@@ -20,7 +20,8 @@ class LeanFc12Launcher(PersistentFc12KernelBase):
     """One warmed launcher owns its scratch and is not concurrently reentrant.
 
     Call once eagerly before CUDA graph capture. Counts and offsets stay on
-    device; changing their contents does not require recompilation.
+    device; changing their contents does not require recompilation. Static,
+    atomic-counter, and alternating claims share the same launch-time reset.
     """
 
     def __init__(self, config: LeanFc12Config, *, gate_up_clamp=None, fast_math=False):
@@ -87,13 +88,20 @@ class LeanFc12Launcher(PersistentFc12KernelBase):
         from .wait_stats import STATS_WORDS, wait_stats_enabled
 
         self._stats_words = STATS_WORDS if wait_stats_enabled() else 0
-        self._done = torch.zeros(
+        # Keep completion/statistics offsets unchanged. The final two words
+        # hold FC1/FC2 dynamic claims (atomic mode uses only the first word).
+        # A single stream-ordered reset covers all counters on every replay;
+        # lean FC12 has no Mega tail/grid barrier to reset them for us.
+        self._counters = torch.zeros(
             (cfg.data_row_capacity + tile_tokens - 1) // tile_tokens
             + cfg.local_num_experts
-            + self._stats_words,
+            + self._stats_words
+            + 2,
             dtype=torch.int32,
             device=device,
         )
+        self._done = self._counters[:-2]
+        self._load_balance_counter = self._counters[-2:]
         self._sf_offsets = torch.empty(
             cfg.local_num_experts + 1, dtype=torch.int32, device=device
         )
@@ -224,7 +232,7 @@ class LeanFc12Launcher(PersistentFc12KernelBase):
             output=None,  # Mega-only all-warp top-k reduction target.
             local_zero_prefix=None,
             shared_zero_prefix=None,
-            load_balance_counter=None,
+            load_balance_counter=_to_cute(self._load_balance_counter, 4),
             peer_rank_ptr_mapper_host=None,
             stream=cuda.CUstream(
                 torch.cuda.current_stream(inputs.activation.device).cuda_stream
@@ -249,7 +257,7 @@ class LeanFc12Launcher(PersistentFc12KernelBase):
         elif self._device != inputs.activation.device:
             raise ValueError("a LeanFc12Launcher cannot be shared between devices")
         runtime = self._runtime(inputs)
-        self._done.zero_()
+        self._counters.zero_()
         self._repack(
             _to_cute(inputs.activation_scales.view(torch.uint8).reshape(-1), 16),
             _to_cute(self._sf.reshape(-1), 16),

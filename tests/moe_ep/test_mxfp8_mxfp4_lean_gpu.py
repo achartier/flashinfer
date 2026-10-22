@@ -329,3 +329,55 @@ def test_lean_eight_warp_epilogue_is_bit_exact(monkeypatch, tile_tokens, mma_m):
             graph.replay()
             torch.cuda.synchronize()
             assert torch.equal(output[rows], baseline)
+
+
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize("mode", ["atomic_counter", "alternating"])
+@pytest.mark.parametrize("mma_m", [128, 256])
+@pytest.mark.parametrize("hidden,intermediate", [(256, 512), (256, 128), (512, 128)])
+def test_lean_dynamic_claims_repeated_and_graph_replay(
+    mode, mma_m, hidden, intermediate
+):
+    """Exercise FC1/FC2 feature ratios and reset claims without a grid tail."""
+    _require_blackwell()
+    launcher, inputs, rows, expected = _case(
+        (0, 3, 257, 65), 128, hidden=hidden, intermediate=intermediate
+    )
+    launcher.tactic.update(
+        mma_tiler_mnk=(mma_m, 64, 128),
+        cluster_shape_mnk=(2 if mma_m == 256 else 1, 1, 1),
+        persistent_clusters=2,
+        num_stages="auto",
+    )
+    # Get a static result from the same geometry before enabling dynamic claims.
+    baseline = launcher.run(inputs)[rows].clone()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(baseline, expected, atol=0.015, rtol=0.05)
+    from flashinfer.moe_ep.cute_dsl.megamoe.mxfp8_mxfp4.lean_kernel import (
+        LeanFc12Launcher,
+    )
+
+    dynamic = LeanFc12Launcher(launcher.config)
+    dynamic.tactic.update(launcher.tactic, load_balance_mode=mode)
+    for _ in range(3):
+        inputs.output.fill_(float("nan"))
+        actual = dynamic.run(inputs)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(actual[rows], baseline, atol=0, rtol=0)
+    counts = inputs.expert_token_sizes.clone()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = dynamic.run(inputs)
+    for _ in range(3):
+        # An empty replay must drain and the next nonempty replay must reclaim
+        # all tiles. Offsets/capacities remain valid for both count vectors.
+        inputs.expert_token_sizes.zero_()
+        inputs.output.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.isnan(actual).all()
+        inputs.expert_token_sizes.copy_(counts)
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(actual[rows], baseline, atol=0, rtol=0)
+        torch.testing.assert_close(actual[rows], expected, atol=0.015, rtol=0.05)

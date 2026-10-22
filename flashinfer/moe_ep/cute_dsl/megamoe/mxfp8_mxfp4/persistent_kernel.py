@@ -439,8 +439,6 @@ class PersistentFc12KernelBase:
         # waits for all ceil(2I / cta_m) tiles of the token block.
         fc2_threshold = (2 * config.intermediate + cta_m - 1) // cta_m
         load_balance_mode = self.tactic["load_balance_mode"]
-        if not self.mega and load_balance_mode != "static":
-            raise ValueError("lean FC12 requires static load balancing")
         flag_batch = self.tactic["flag_batch"]
         num_stages = self.tactic["num_stages"]
         if num_stages == "auto":

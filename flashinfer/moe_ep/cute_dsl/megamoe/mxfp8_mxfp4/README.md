@@ -123,6 +123,12 @@ in the default policy above; single-CTA tiles are used otherwise.
 | `cta_local_counts` | `True` | Boolean. Each CTA acquires startup signals and computes owner counts into reusable shared scratch, removing the closing startup grid rendezvous. CTA 0 retains a global diagnostic copy. |
 
 Dispatch and startup options affect Mega execution, not lean/split FC12.
+The lean launcher also supports `atomic_counter` and `alternating` when selected
+in its tactic before warmup. Its default remains `static`. It owns two claim
+counter words alongside FC1 completion/statistics storage and clears the whole
+buffer before every launch, including CUDA graph replay. It does not rely on
+the Mega communication tail to reset claims. FC2 uses the shared scheduler's
+FC1 dependency checks and alternating FC1 warmup.
 Use `validate_tactic` for host validation and `resolve_tactic` to inspect the
 complete tactic. Passing host validation alone does not guarantee that a
 configuration fits shared memory or is accepted by the device assembler.
